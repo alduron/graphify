@@ -1811,7 +1811,310 @@ def _get_cpp_func_name(node, source: bytes) -> str | None:
     return None
 
 
-# ── JS/TS extra walk for arrow functions ──────────────────────────────────────
+# UE smart-pointer / class-reference wrappers whose meaningful type is the inner
+# generic argument (TObjectPtr<UInventoryComponent> gives UInventoryComponent).
+# Used to type member-call receivers stored as `TObjectPtr<T> Field;`.
+_CPP_SMART_PTR_WRAPPERS = frozenset({
+    "TObjectPtr", "TWeakObjectPtr", "TSoftObjectPtr", "TSubclassOf",
+    "TSoftClassPtr", "TSharedPtr", "TSharedRef", "TUniquePtr", "TWeakPtr",
+    "TScriptInterface",
+})
+
+
+def _cpp_split_qualified(node, source: bytes) -> tuple[list[str], str | None]:
+    """Split a `qualified_identifier` into (scope_names, final_name).
+
+    `UFoo::Bar`     gives (["UFoo"], "Bar")
+    `NS::UFoo::Bar` gives (["NS", "UFoo"], "Bar")  (immediate class = scopes[-1])
+    """
+    scopes: list[str] = []
+    cur = node
+    while cur is not None and cur.type == "qualified_identifier":
+        scope = cur.child_by_field_name("scope")
+        if scope is not None:
+            scopes.append(_read_text(scope, source))
+        name = cur.child_by_field_name("name")
+        if name is None:
+            return scopes, None
+        if name.type == "qualified_identifier":
+            cur = name
+            continue
+        return scopes, _read_text(name, source)
+    return scopes, None
+
+
+def _cpp_qualified_method_parts(func_def, source: bytes) -> tuple[str, str] | None:
+    """For an out-of-line definition (`RetType NS::UFoo::Bar(...) { }`), return
+    (class_name, method_name); None for an ordinary free/in-class function.
+
+    Unwraps pointer/reference return declarators to reach the function_declarator
+    whose own declarator is the `qualified_identifier` carrying the class scope.
+    """
+    decl = func_def.child_by_field_name("declarator")
+    while decl is not None and decl.type in ("pointer_declarator", "reference_declarator"):
+        decl = decl.child_by_field_name("declarator")
+    if decl is None or decl.type != "function_declarator":
+        return None
+    inner = decl.child_by_field_name("declarator")
+    if inner is None or inner.type != "qualified_identifier":
+        return None
+    scopes, name = _cpp_split_qualified(inner, source)
+    if not scopes or not name:
+        return None
+    return scopes[-1], name
+
+
+def _cpp_receiver_name(node, source: bytes) -> str | None:
+    """Simple receiver name for a member call's object (`Inventory->x()` gives
+    "Inventory", `this->x()` gives "this"). Chained receivers (`GetOwner()->x()`)
+    return None."""
+    if node is None:
+        return None
+    if node.type in ("identifier", "field_identifier"):
+        return _read_text(node, source)
+    if node.type == "this":
+        return "this"
+    return None
+
+
+def _cpp_first_template_type(node, source: bytes) -> str | None:
+    """First concrete type inside a `template_argument_list` under `node`
+    (`FindComponentByClass<UInventoryComponent>` gives "UInventoryComponent")."""
+    for child in node.children:
+        if child.type == "template_argument_list":
+            for arg in child.children:
+                if arg.type == "type_descriptor":
+                    for sub in arg.children:
+                        if sub.type == "type_identifier":
+                            return _read_text(sub, source)
+                elif arg.type == "type_identifier":
+                    return _read_text(arg, source)
+        elif child.type in ("template_method", "template_function"):
+            found = _cpp_first_template_type(child, source)
+            if found:
+                return found
+    return None
+
+
+def _cpp_member_type_name(type_node, source: bytes) -> str | None:
+    """Resolve a member/local declaration's type to a single class name, unwrapping
+    UE smart pointers (`TObjectPtr<UInventoryComponent>` gives "UInventoryComponent")
+    and pointers/references/const so a receiver like `Inventory` types cleanly."""
+    if type_node is None:
+        return None
+    refs: list[tuple[str, str]] = []
+    _cpp_collect_type_refs(type_node, source, False, refs)
+    base = None
+    generic = None
+    for name, role in refs:
+        if role == "type" and base is None:
+            base = name
+        elif role == "generic_arg" and generic is None:
+            generic = name
+    if base in _CPP_SMART_PTR_WRAPPERS and generic:
+        return generic
+    return base
+
+
+def _cpp_capture_local_decl(node, source: bytes, table: dict[str, str]) -> None:
+    """Record `Type* var = ...;` local variable types into `table` (name -> type) so
+    member calls (`var->method()`) can be typed. Skips function prototypes and
+    `auto`/untyped declarations (no explicit type to record)."""
+    type_node = node.child_by_field_name("type")
+    if type_node is None:
+        return
+    tname = _cpp_member_type_name(type_node, source)
+    if not tname:
+        return
+    for decl in node.children_by_field_name("declarator"):
+        d = decl
+        if d.type == "init_declarator":
+            d = d.child_by_field_name("declarator")
+        if d is None:
+            continue
+        probe = d
+        while probe is not None and probe.type in ("pointer_declarator", "reference_declarator"):
+            probe = probe.child_by_field_name("declarator")
+        if probe is not None and probe.type == "function_declarator":
+            continue  # a function prototype, not a variable
+        vname = _get_cpp_func_name(d, source)
+        if vname:
+            table[vname] = tname
+
+
+# UE DLL-export macros (`MYGAME_API`, `ENGINE_API`, ...) between `class`/`struct`
+# and the type name make tree-sitter-cpp fail to form the class node, swallowing
+# the whole declaration. Blank the macro to equal-length spaces (byte offsets /
+# line numbers preserved) so the class parses; mirrors ObjC macro-blanking (#1475).
+_CPP_EXPORT_MACRO_RE = re.compile(r"(\b(?:class|struct)[ \t]+)([A-Z][A-Z0-9_]*_API)([ \t]+)")
+
+# UE reflection macros used as statements inside a class body. `GENERATED_BODY()`
+# and friends expand to declarations WITHOUT a trailing `;` in source, and
+# `UPROPERTY(...)`/`UFUNCTION(...)` prefix a member with no separator; both make
+# tree-sitter-cpp merge the following member into an ERROR node and drop it. We
+# blank each macro (name + its balanced parens) to spaces so the real C++
+# declarations underneath parse cleanly. Newlines are preserved so line numbers
+# (and byte length) stay stable, matching the ObjC macro-blanking approach.
+_CPP_UE_MACRO_NAMES = (
+    "UCLASS", "USTRUCT", "UENUM", "UINTERFACE", "UPROPERTY", "UFUNCTION",
+    "UPARAM", "UDELEGATE", "UMETA", "GENERATED_BODY", "GENERATED_UCLASS_BODY",
+    "GENERATED_USTRUCT_BODY", "GENERATED_IINTERFACE_BODY", "GENERATED_UINTERFACE_BODY",
+)
+_CPP_UE_MACRO_RE = re.compile(
+    r"\b(?:" + "|".join(_CPP_UE_MACRO_NAMES) + r")\b"
+)
+
+
+def _cpp_code_mask(text: str) -> list[bool]:
+    """Per-character mask: True where `text[i]` is real code, False inside a string
+    literal ("..." with backslash escapes), raw string literal (R"delim(...)delim",
+    multi-line, no escapes), char literal ('...'), // line comment, or /* */ block
+    comment. A `'` used as a C++14 digit separator (1'000) is treated as code.
+
+    Shared by the UE-macro blanking (a naive paren counter mis-scans a macro arg
+    list containing an unbalanced paren inside a string, e.g.
+    `UPROPERTY(meta=(ToolTip="Press ( to open"))`, poisoning the whole class body)
+    and by the `.h` C++ sniff (so `/* virtual address */` or `"::1"` in a plain C
+    header cannot trip the C++ markers)."""
+    n = len(text)
+    mask = [True] * n
+    i = 0
+    while i < n:
+        c = text[i]
+        if c == '"' and i > 0 and text[i - 1] == "R":
+            # Raw string literal R"delim( ... )delim" (optional u8/u/U/L prefix).
+            # Raw strings have NO escapes and may span newlines: the regular
+            # scanner below would stop at the first newline, leaving the body
+            # marked as code -- a UE macro name inside the literal (codegen
+            # template, doc string) would then be blanked along with the raw
+            # string's closing paren, corrupting the whole file into a silent
+            # zero-node extraction.
+            j = i - 1  # index of the R
+            k = j
+            if k >= 2 and text[k - 2:k] == "u8":
+                k -= 2
+            elif k >= 1 and text[k - 1] in "uUL":
+                k -= 1
+            # The prefix must start at an identifier boundary (`FOOBAR"x"` is
+            # some other token, not a raw string).
+            boundary_ok = k == 0 or not (text[k - 1].isalnum() or text[k - 1] == "_")
+            if boundary_ok:
+                open_paren = text.find("(", i + 1, i + 18)  # delim is at most 16 chars
+                if open_paren != -1:
+                    delim = text[i + 1:open_paren]
+                    if not any(ch in ')\\ \t\n"' for ch in delim):
+                        closer = ")" + delim + '"'
+                        close_at = text.find(closer, open_paren + 1)
+                        end = n if close_at == -1 else close_at + len(closer)
+                        for x in range(i, end):
+                            mask[x] = False
+                        i = end
+                        continue
+        if (c == "'" and 0 < i and i + 1 < n
+                and text[i - 1].isdigit() and text[i + 1].isalnum()):
+            # C++14 digit separator (1'000'000, 0x1'FF), not a char-literal opener.
+            i += 1
+            continue
+        if c == '"' or c == "'":
+            quote = c
+            mask[i] = False
+            i += 1
+            while i < n:
+                mask[i] = False
+                if text[i] == "\\":
+                    if i + 1 < n:
+                        mask[i + 1] = False
+                    i += 2
+                    continue
+                if text[i] == quote or text[i] == "\n":
+                    # Unterminated literals end at the newline so one stray quote
+                    # cannot swallow the rest of the file.
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                mask[i] = False
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            mask[i] = False
+            mask[i + 1] = False
+            i += 2
+            while i < n:
+                mask[i] = False
+                if text[i] == "*" and i + 1 < n and text[i + 1] == "/":
+                    mask[i + 1] = False
+                    i += 2
+                    break
+                i += 1
+            continue
+        i += 1
+    return mask
+
+
+def _blank_balanced_parens(text: str, open_idx: int, mask: list[bool]) -> int:
+    """Return the index just past the `)` matching the `(` at `text[open_idx]`
+    (or `open_idx` unchanged if the parens are unbalanced). Only parens that are
+    real code per `mask` are counted, so a stray `(`/`)` inside a string literal
+    or comment within the macro's argument list cannot derail the scan."""
+    depth = 0
+    i = open_idx
+    n = len(text)
+    while i < n:
+        if mask[i]:
+            c = text[i]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+        i += 1
+    return open_idx  # unbalanced; leave as-is
+
+
+def _preprocess_cpp_source(source: bytes) -> bytes:
+    if b"_API" not in source and not any(
+        m.encode() in source for m in _CPP_UE_MACRO_NAMES
+    ):
+        return source
+
+    text = source.decode("utf-8", errors="replace")
+    mask = _cpp_code_mask(text)
+    chars = list(text)
+
+    def _blank_range(start: int, end: int) -> None:
+        for i in range(start, end):
+            if chars[i] != "\n":
+                chars[i] = " "
+
+    # Export macros (`class MYGAME_API UFoo`): blank only matches in real code.
+    for m in _CPP_EXPORT_MACRO_RE.finditer(text):
+        if mask[m.start(2)]:
+            _blank_range(m.start(2), m.end(2))
+
+    for m in _CPP_UE_MACRO_RE.finditer(text):
+        start = m.start()
+        # A macro name inside a string literal or comment is not a live macro
+        # (e.g. `const char* s = "UFUNCTION(...)";`); blanking it would corrupt
+        # the literal and start a paren scan from inside the string.
+        if not mask[start]:
+            continue
+        end = m.end()
+        # Skip whitespace to see if the macro is invoked with `(...)`.
+        j = end
+        while j < len(text) and text[j] in " \t":
+            j += 1
+        if j < len(text) and text[j] == "(":
+            end = _blank_balanced_parens(text, j, mask)
+        _blank_range(start, end)
+
+    return "".join(chars).encode("utf-8")
+
+
+# JS/TS extra walk for arrow functions
 
 def _find_require_call(value_node):
     """Return the call_expression node if `value_node` is a `require(...)` call
@@ -2237,7 +2540,9 @@ _C_CONFIG = LanguageConfig(
 
 _CPP_CONFIG = LanguageConfig(
     ts_module="tree_sitter_cpp",
-    class_types=frozenset({"class_specifier", "struct_specifier"}),
+    # enum_specifier (incl. `enum class`) is a node-producing type so C++ enums
+    # get an enum node + case_of enumerator edges, matching other OOP languages.
+    class_types=frozenset({"class_specifier", "struct_specifier", "enum_specifier"}),
     function_types=frozenset({"function_definition"}),
     import_types=frozenset({"preproc_include"}),
     call_types=frozenset({"call_expression"}),
@@ -2599,6 +2904,7 @@ def _extract_generic(
     # #1356: per-file map of local name -> declared type (properties + params),
     # threaded out as `swift_type_table` so member calls (`vm.update()`) can be
     # resolved to the receiver's real definition in _resolve_swift_member_calls.
+    # C++ reuses this table (member fields + local vars) as `cpp_type_table`.
     type_table: dict[str, str] = {}
 
     csharp_interface_names: set[str] = set()
@@ -2704,6 +3010,14 @@ def _extract_generic(
 
         # Class types
         if t in config.class_types:
+            # C++ forward declarations (`class UFoo;`, `enum class EItemType : uint8;`)
+            # are bodyless specifiers, ubiquitous in UE headers. Minting a sourced
+            # node for one creates a second "definition" of the type, which trips the
+            # single-definition god-node guard in _resolve_cpp_calls and silently
+            # disables type resolution against it. Only real definitions get nodes.
+            if (config.ts_module == "tree_sitter_cpp"
+                    and node.child_by_field_name("body") is None):
+                return
             # Resolve class name
             name_node = node.child_by_field_name(config.name_field)
             if name_node is None:
@@ -3138,6 +3452,25 @@ def _extract_generic(
                     walk(child, parent_class_nid=class_nid)
             return
 
+        # C++ enumerators: each `enumerator` inside an `enum_specifier` body becomes
+        # a member node with a `case_of` edge to the enum, mirroring Swift enum cases.
+        if (config.ts_module == "tree_sitter_cpp"
+                and t == "enumerator"
+                and parent_class_nid):
+            name_node = node.child_by_field_name("name")
+            if name_node is None:
+                for child in node.children:
+                    if child.type == "identifier":
+                        name_node = child
+                        break
+            if name_node is not None:
+                case_name = _read_text(name_node, source)
+                case_nid = _make_id(parent_class_nid, case_name)
+                line = node.start_point[0] + 1
+                add_node(case_nid, case_name, line)
+                add_edge(parent_class_nid, case_nid, "case_of", line)
+            return
+
         # Event listener property arrays: $listen = [Event::class => [Listener::class]]
         if (t == "property_declaration"
                 and parent_class_nid
@@ -3318,10 +3651,14 @@ def _extract_generic(
                     and any(c.type == "function_declarator" for c in d.children))
                 for d in decls
             )
+            member_type: str | None = None
             if not is_method:
                 type_node = node.child_by_field_name("type")
                 if type_node is not None:
                     line = node.start_point[0] + 1
+                    # Receiver-typing hint: `Inventory` in `TObjectPtr<UInv> Inventory;`
+                    # gets typed to UInv so `Inventory->Add()` resolves cross-file.
+                    member_type = _cpp_member_type_name(type_node, source)
                     refs: list[tuple[str, str]] = []
                     _cpp_collect_type_refs(type_node, source, False, refs)
                     for ref_name, role in refs:
@@ -3334,14 +3671,22 @@ def _extract_generic(
             # only visit declarator children, not the type node (which would give
             # us the type name, not the field name). Handles int x, y; via
             # multiple declarator fields and static const int MAX = 100; via the
-            # init_declarator → field_identifier recursion in _get_cpp_func_name.
+            # init_declarator field_identifier recursion in _get_cpp_func_name.
             for decl in decls:
                 name = _get_cpp_func_name(decl, source)
                 if name:
                     line = decl.start_point[0] + 1
                     field_nid = _make_id(parent_class_nid, name)
+                    was_new = field_nid not in seen_ids
                     add_node(field_nid, name, line)
+                    # Stash the field's resolved type on the node so cross-file member
+                    # calls (`Inventory->x()` in a .cpp, field declared in the .h) can
+                    # type the receiver via a corpus-level (class, field) -> type index.
+                    if was_new and member_type:
+                        nodes[-1]["cpp_type"] = member_type
                     add_edge(parent_class_nid, field_nid, "defines", line, context="field")
+                    if member_type:
+                        type_table[name] = member_type
             return
 
         # Function types
@@ -3370,10 +3715,23 @@ def _extract_generic(
                 return
 
             line = node.start_point[0] + 1
+            # C++ out-of-line definition (`RetType UFoo::Bar(...) {}`) defined at file
+            # scope: the declarator carries the class qualifier the generic name
+            # resolver stripped. Preserve it in the label and record the method for
+            # corpus-level linking to its class (which usually lives in another file).
+            cpp_ool = None
+            if config.ts_module == "tree_sitter_cpp" and parent_class_nid is None:
+                cpp_ool = _cpp_qualified_method_parts(node, source)
             if parent_class_nid:
                 func_nid = _make_id(parent_class_nid, func_name)
                 add_node(func_nid, f".{func_name}()", line)
                 add_edge(parent_class_nid, func_nid, "method", line)
+            elif cpp_ool:
+                cls_name, m_name = cpp_ool
+                func_nid = _make_id(stem, cls_name, m_name)
+                # Label preserves the class qualifier (`UFoo::Bar()`); the corpus pass
+                # _resolve_cpp_calls finds these by shape and links them to the class.
+                add_node(func_nid, f"{cls_name}::{m_name}()", line)
             else:
                 func_nid = _make_id(stem, func_name)
                 add_node(func_nid, f"{func_name}()", line)
@@ -3733,6 +4091,11 @@ def _extract_generic(
         if node.type in config.function_boundary_types:
             return
 
+        # C++ local variable declarations (`UInv* Inv = ...;`) type receivers so a
+        # later `Inv->method()` resolves cross-file (mirrors Swift's type table).
+        if config.ts_module == "tree_sitter_cpp" and node.type == "declaration":
+            _cpp_capture_local_decl(node, source, type_table)
+
         if node.type in config.call_types:
             # JS/TS dynamic imports: await import('./foo.js')
             if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
@@ -3747,6 +4110,9 @@ def _extract_generic(
             is_member_call: bool = False
             swift_receiver: str | None = None
             member_receiver: str | None = None
+            cpp_receiver: str | None = None
+            cpp_receiver_is_type: bool = False
+            cpp_template_arg: str | None = None
 
             # Special handling per language
             if config.ts_module == "tree_sitter_swift":
@@ -3831,16 +4197,41 @@ def _extract_generic(
                     if name_node:
                         callee_name = _read_text(name_node, source)
             elif config.ts_module == "tree_sitter_cpp":
-                # C++: function field, then field_expression/qualified_identifier
+                # C++: function field, then field_expression/qualified_identifier.
+                # Capture the receiver (object of `->`/`.`, or `::` class scope) and
+                # any template arg (FindComponentByClass<T>) so _resolve_cpp_calls can
+                # type the receiver and link the call to Type::Method cross-file.
                 func_node = node.child_by_field_name(config.call_function_field) if config.call_function_field else None
                 if func_node:
                     if func_node.type == "identifier":
                         callee_name = _read_text(func_node, source)
-                    elif func_node.type in ("field_expression", "qualified_identifier"):
+                    elif func_node.type == "template_function":
+                        # Free call with template args: `NewObject<UFoo>()`.
+                        nm = func_node.child_by_field_name("name")
+                        if nm is not None:
+                            callee_name = _read_text(nm, source)
+                        cpp_template_arg = _cpp_first_template_type(func_node, source)
+                    elif func_node.type == "field_expression":
                         is_member_call = True
-                        name = func_node.child_by_field_name("field") or func_node.child_by_field_name("name")
-                        if name:
-                            callee_name = _read_text(name, source)
+                        fld = func_node.child_by_field_name("field")
+                        if fld is not None:
+                            if fld.type == "template_method":
+                                nm = fld.child_by_field_name("name")
+                                callee_name = _read_text(nm, source) if nm is not None else None
+                                cpp_template_arg = _cpp_first_template_type(fld, source)
+                            else:
+                                callee_name = _read_text(fld, source)
+                        cpp_receiver = _cpp_receiver_name(
+                            func_node.child_by_field_name("argument"), source)
+                    elif func_node.type == "qualified_identifier":
+                        # Static / scoped call: `UFoo::StaticBar()`. The scope is the
+                        # class named explicitly in source, so treat it as a type.
+                        is_member_call = True
+                        scopes, nm = _cpp_split_qualified(func_node, source)
+                        callee_name = nm
+                        if scopes:
+                            cpp_receiver = scopes[-1]
+                            cpp_receiver_is_type = True
             elif config.ts_module == "tree_sitter_java" and node.type == "object_creation_expression":
                 # `new Foo(...)` — the constructed type is in the `type` field, not
                 # `name`, so the generic path misses it (#1373). Reduce a qualified
@@ -3923,7 +4314,7 @@ def _extract_generic(
                         "is_member_call": is_member_call,
                         "source_file": str_path,
                         "source_location": f"L{node.start_point[0] + 1}",
-                        "receiver": swift_receiver or member_receiver,
+                        "receiver": swift_receiver or member_receiver or cpp_receiver,
                     }
                     # Ruby: attach the receiver's inferred type from the method's
                     # local `var = Const.new` bindings, when unambiguously known.
@@ -3931,6 +4322,12 @@ def _extract_generic(
                         rc_entry["receiver_type"] = ruby_var_types.get(
                             caller_nid, {}
                         ).get(member_receiver)
+                    # C++: mark whether the receiver is an explicitly-named class
+                    # (`UFoo::` scope) vs. an instance, and carry any template arg
+                    # so _resolve_cpp_calls can type the receiver / link components.
+                    if config.ts_module == "tree_sitter_cpp":
+                        rc_entry["receiver_is_type"] = cpp_receiver_is_type
+                        rc_entry["template_arg"] = cpp_template_arg
                     raw_calls.append(rc_entry)
 
             # Helper function calls: config('foo.bar') → uses_config edge to "foo"
@@ -4107,7 +4504,11 @@ def _extract_generic(
     if swift_extensions:
         result["swift_extensions"] = swift_extensions
     if type_table:
-        result["swift_type_table"] = {"path": str_path, "table": type_table}
+        # Shared local name -> type table; keyed per consuming resolver.
+        if config.ts_module == "tree_sitter_cpp":
+            result["cpp_type_table"] = {"path": str_path, "table": type_table}
+        else:
+            result["swift_type_table"] = {"path": str_path, "table": type_table}
     return result
 
 
@@ -4753,7 +5154,14 @@ def extract_c(path: Path) -> dict:
 
 def extract_cpp(path: Path) -> dict:
     """Extract functions, classes, and includes from a .cpp/.cc/.cxx/.hpp file."""
-    return _extract_generic(path, _CPP_CONFIG)
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return _extract_generic(path, _CPP_CONFIG)
+    processed = _preprocess_cpp_source(raw)
+    if processed is raw:
+        return _extract_generic(path, _CPP_CONFIG)
+    return _extract_generic(path, _CPP_CONFIG, source_override=processed)
 
 
 def extract_ruby(path: Path) -> dict:
@@ -9677,9 +10085,239 @@ def _resolve_python_member_calls(
         })
 
 
+def _resolve_cpp_calls(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Cross-file C++ resolution: (1) link out-of-line method definitions to their
+    class, and (2) resolve member calls (`recv->method()`, `Type::static()`,
+    `Find/GetComponent<T>`) to the real method/type in another file.
+
+    The idiomatic C++/UE split (declare in `.h`, define in `.cpp`) and cross-file
+    member calls both need corpus-wide knowledge the per-file pass lacks. The shared
+    cross-file call pass drops every `is_member_call` (a bare method name collides
+    across the corpus), so C++ member calls only ever get edges here. Every emission
+    is guarded by a single-definition class lookup (the god-node guard); the
+    unknown-receiver fallback additionally requires a corpus-unique method name.
+
+    Must run after id-disambiguation so node ids and caller_nids are final.
+    """
+    def _key(label: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9]+", "", str(label)).lower()
+
+    def _method_key(label: str) -> str:
+        # Method labels are ".Bar()" (in-class) or "UFoo::Bar()" (out-of-line);
+        # both reduce to the bare method name for indexing.
+        tail = str(label).strip().strip("()").lstrip(".").split("::")[-1]
+        return _key(tail)
+
+    node_by_id: dict[str, dict] = {n.get("id"): n for n in all_nodes}
+    contained = {e.get("target") for e in all_edges if e.get("relation") == "contains"}
+
+    # Class label -> [class node ids]. Real, source-backed, contained, type-like
+    # only; len != 1 is the god-node guard (an ambiguous class name bails).
+    type_def_nids: dict[str, list[str]] = {}
+    for n in all_nodes:
+        if n.get("source_file") and n.get("id") in contained and _is_type_like_definition(n):
+            type_def_nids.setdefault(_key(n.get("label", "")), []).append(n["id"])
+
+    def resolve_class(name: str | None) -> str | None:
+        if not name:
+            return None
+        defs = type_def_nids.get(_key(name), [])
+        return defs[0] if len(defs) == 1 else None
+
+    existing_pairs = {(e.get("source"), e.get("target")) for e in all_edges}
+
+    def _emit(src: str, tgt: str, relation: str, context: str, confidence: str,
+              score: float, rc: dict) -> None:
+        if not src or not tgt or src == tgt or (src, tgt) in existing_pairs:
+            return
+        existing_pairs.add((src, tgt))
+        all_edges.append({
+            "source": src, "target": tgt, "relation": relation, "context": context,
+            "confidence": confidence, "confidence_score": score,
+            "source_file": rc.get("source_file", ""),
+            "source_location": rc.get("source_location"), "weight": 1.0,
+        })
+
+    # (1) Attach out-of-line method definitions to their (usually cross-file) class.
+    # Out-of-line method nodes are identified by their `Class::method()` label shape
+    # (set by the extractor); working off the final node label survives the id-remap
+    # that a stored extraction-time node id would not (Foo.h / Foo.cpp share a stem).
+    # The `X::Y()` label shape is produced only by the C++ extractor, by convention;
+    # no other language labels symbols with a `::` qualifier plus `()` suffix.
+    for n in all_nodes:
+        label = str(n.get("label", ""))
+        if "::" not in label or not label.endswith("()"):
+            continue
+        cls_name, _, rest = label.partition("::")
+        if not cls_name or not rest:
+            continue
+        cls_nid = resolve_class(cls_name)
+        mnid = n.get("id")
+        if not cls_nid or not mnid or cls_nid == mnid:
+            continue
+        if (cls_nid, mnid) in existing_pairs:
+            continue
+        existing_pairs.add((cls_nid, mnid))
+        all_edges.append({
+            "source": cls_nid, "target": mnid, "relation": "method",
+            "context": "method", "confidence": "EXTRACTED", "confidence_score": 1.0,
+            "source_file": n.get("source_file", ""),
+            "source_location": n.get("source_location"), "weight": 1.0,
+        })
+
+    # (2) Build indices over all `method` edges (now including those just added).
+    method_index: dict[tuple[str, str], str] = {}   # (class_nid, method_key) -> method_nid
+    owner_class_of: dict[str, str] = {}              # method_nid -> class_nid (for `this`)
+    methods_by_key: dict[str, list[str]] = {}        # method_key -> [method_nid] (fallback)
+    for e in all_edges:
+        if e.get("relation") != "method":
+            continue
+        src, tgt = e.get("source"), e.get("target")
+        tnode = node_by_id.get(tgt)
+        if tnode is None:
+            continue
+        mk = _method_key(tnode.get("label", ""))
+        method_index[(src, mk)] = tgt
+        owner_class_of.setdefault(tgt, src)
+        methods_by_key.setdefault(mk, []).append(tgt)
+    for k in list(methods_by_key):
+        methods_by_key[k] = sorted(set(methods_by_key[k]))
+
+    # Base-class map so a call to an inherited method resolves up the hierarchy.
+    bases_of: dict[str, list[str]] = {}
+    for e in all_edges:
+        if e.get("relation") == "inherits":
+            bases_of.setdefault(e.get("source"), []).append(e.get("target"))
+
+    # (class_nid, field_key) -> field type name, from `defines` field edges whose
+    # field node carries a `cpp_type`. Lets a member call in a .cpp type its receiver
+    # against a field declared in the class's .h (the .cpp has no local for it).
+    field_type_by_class: dict[tuple[str, str], str] = {}
+    for e in all_edges:
+        if e.get("relation") != "defines" or e.get("context") != "field":
+            continue
+        fnode = node_by_id.get(e.get("target"))
+        if fnode is None:
+            continue
+        ftype = fnode.get("cpp_type")
+        if ftype:
+            field_type_by_class[(e.get("source"), _key(fnode.get("label", "")))] = ftype
+
+    def field_type(cls_nid: str, field_name: str, seen: set | None = None) -> str | None:
+        if not cls_nid:
+            return None
+        if seen is None:
+            seen = set()
+        if cls_nid in seen:
+            return None
+        seen.add(cls_nid)
+        hit = field_type_by_class.get((cls_nid, _key(field_name)))
+        if hit:
+            return hit
+        for base in bases_of.get(cls_nid, []):
+            r = field_type(base, field_name, seen)
+            if r:
+                return r
+        return None
+
+    def lookup_method(cls_nid: str, mk: str, seen: set | None = None) -> str | None:
+        if seen is None:
+            seen = set()
+        if cls_nid in seen:
+            return None
+        seen.add(cls_nid)
+        hit = method_index.get((cls_nid, mk))
+        if hit:
+            return hit
+        for base in bases_of.get(cls_nid, []):
+            r = lookup_method(base, mk, seen)
+            if r:
+                return r
+        return None
+
+    type_table_by_file: dict[str, dict[str, str]] = {}
+    for result in per_file:
+        tt = result.get("cpp_type_table")
+        if tt and tt.get("path"):
+            type_table_by_file[tt["path"]] = tt.get("table", {})
+
+    all_raw_calls: list[dict] = []
+    for result in per_file:
+        all_raw_calls.extend(result.get("raw_calls", []))
+
+    for rc in all_raw_calls:
+        if not rc.get("is_member_call"):
+            continue
+        # Only C++ raw calls carry these keys; skip other languages' member calls.
+        if "receiver_is_type" not in rc and "template_arg" not in rc:
+            continue
+        callee = rc.get("callee")
+        caller = rc.get("caller_nid")
+        if not caller:
+            continue
+        src_file = rc.get("source_file", "")
+
+        # Template arg is a strong "uses this component/type" signal
+        # (FindComponentByClass<UInventoryComponent>): emit a references edge so the
+        # component's callers are visible even when the call target is an engine method.
+        template_arg = rc.get("template_arg")
+        if template_arg:
+            comp_nid = resolve_class(template_arg)
+            if comp_nid:
+                _emit(caller, comp_nid, "references", "component", "EXTRACTED", 1.0, rc)
+
+        if not callee:
+            continue
+        mk = _key(callee)
+        receiver = rc.get("receiver")
+
+        # Determine the receiver's type.
+        type_name = None
+        type_qualified = False
+        if rc.get("receiver_is_type"):
+            type_name = receiver          # `UFoo::Bar()` names the class in source
+            type_qualified = True
+        elif receiver == "this":
+            cls = owner_class_of.get(caller)
+            if cls:
+                mnid = lookup_method(cls, mk)
+                if mnid:
+                    _emit(caller, mnid, "calls", "call", "EXTRACTED", 1.0, rc)
+            continue
+        elif receiver:
+            # A local variable (per-file table) shadows a member field; if neither
+            # types it, fall back to a field of the caller's enclosing class (which
+            # may be declared in another file, e.g. the class's .h).
+            type_name = type_table_by_file.get(src_file, {}).get(receiver)
+            if not type_name:
+                type_name = field_type(owner_class_of.get(caller), receiver)
+
+        if type_name:
+            cls_nid = resolve_class(type_name)
+            if cls_nid:
+                mnid = lookup_method(cls_nid, mk)
+                if mnid:
+                    conf = "EXTRACTED" if type_qualified else "INFERRED"
+                    _emit(caller, mnid, "calls", "call", conf,
+                          1.0 if type_qualified else 0.8, rc)
+            # Receiver type was determinable: do not also try the fuzzy name
+            # fallback (would risk a wrong same-named method on another class).
+            continue
+
+        # Unknown receiver: conservative fallback, only when the method name is
+        # corpus-unique (mirrors the shared resolver's single-candidate guard).
+        cands = [c for c in methods_by_key.get(mk, []) if c != caller]
+        if len(cands) == 1:
+            _emit(caller, cands[0], "calls", "call", "INFERRED", 0.6, rc)
+
+
 # Register the cross-file, language-specific member-call resolvers into the shared
 # registry (framework lives in graphify.resolver_registry). A new language plugs in
-# by adding one register() call below — no edits to extract()'s body. Order
+# by adding one register() call below, no edits to extract()'s body. Order
 # preserved from the prior inlined wiring: Swift (#1356) before Python (#1446).
 register_language_resolver(
     LanguageResolver("swift_member_calls", frozenset({".swift"}), _resolve_swift_member_calls)
@@ -9691,6 +10329,15 @@ register_language_resolver(
 # graphify.ruby_resolution; registered here as a second consumer of the framework.
 register_language_resolver(
     LanguageResolver("ruby_member_calls", frozenset({".rb"}), resolve_ruby_member_calls)
+)
+# C++ out-of-line method linking + member-call resolution. `.h` is included because
+# C++/UE headers route to extract_cpp via the content sniff in _get_extractor.
+register_language_resolver(
+    LanguageResolver(
+        "cpp_member_calls",
+        frozenset({".cpp", ".cc", ".cxx", ".hpp", ".cu", ".cuh", ".metal", ".h"}),
+        _resolve_cpp_calls,
+    )
 )
 
 
@@ -13222,6 +13869,55 @@ def _is_objc_header(path: Path) -> bool:
     return any(marker in head for marker in _OBJC_HEADER_MARKERS)
 
 
+# UE annotation macros are illegal in C and are the strongest signal that a `.h`
+# is a C++/Unreal header (every UCLASS/USTRUCT/UENUM declares its type in the .h).
+_CPP_HEADER_UE_MARKERS = (
+    "UCLASS", "USTRUCT", "UENUM", "UINTERFACE", "GENERATED_BODY",
+    "GENERATED_UCLASS_BODY", "UPROPERTY", "UFUNCTION",
+)
+# C++-only constructs that never appear in valid C. Each alternative is anchored so
+# a C header that merely uses a C++ keyword as an identifier (Linux-kernel style:
+# `int class;`, `->private`) does not trip the sniff: `class`/`struct` require a
+# following type name plus `{`/`:`/`;`; `public`/`private`/`protected` require the
+# access-specifier colon; `namespace` requires a name + `{`; `virtual` requires a
+# following type-ish token (so a C variable literally named `virtual` cannot trip
+# it). `::` and `template<` are syntactically impossible in C code, and the sniff
+# runs on comment/string-stripped text so prose like `/* virtual address */` or
+# literals like "::1" cannot match.
+_CPP_HEADER_RE = re.compile(
+    r"\bclass\s+\w+\s*[:{;]"                       # class Foo {  / : Base / ;
+    r"|\bstruct\s+\w+\s*:"                         # struct Foo : Base (C structs have no base)
+    r"|\bnamespace\s+\w+\s*\{"                     # namespace X {
+    r"|\btemplate\s*<"                             # template<
+    r"|\b(?:public|private|protected)\s*:"         # access specifier
+    r"|::"                                          # scope resolution
+    r"|\bvirtual\s+[\w~]"                          # virtual <type> / virtual ~Dtor
+)
+
+
+def _is_cpp_header(path: Path) -> bool:
+    """Whether a `.h` file is C++ (incl. Unreal) rather than plain C.
+
+    The suffix map sends `.h` to extract_c, whose _C_CONFIG has no class types, so
+    every C++/UE class, struct, method, and field declared in a header is invisible
+    (Unreal declares all of them in `.h`). A content sniff for C++-only constructs
+    reroutes genuine C++ headers to extract_cpp while leaving Linux-kernel-style C
+    headers (which the C++ grammar chokes on) on extract_c. Comments and string
+    literals are stripped first so they cannot produce false positives. Runs after
+    the ObjC sniff, so ObjC headers keep priority.
+    """
+    try:
+        head = path.read_bytes()[:256 * 1024]
+    except OSError:
+        return False
+    text = head.decode("utf-8", errors="replace")
+    mask = _cpp_code_mask(text)
+    code = "".join(c if m else " " for c, m in zip(text, mask))
+    if any(marker in code for marker in _CPP_HEADER_UE_MARKERS):
+        return True
+    return _CPP_HEADER_RE.search(code) is not None
+
+
 def _get_extractor(path: Path) -> Any | None:
     """Return the correct extractor function for a file, or None if unsupported."""
     if path.name.endswith(".blade.php"):
@@ -13236,10 +13932,15 @@ def _get_extractor(path: Path) -> Any | None:
     # (#1377). apm.yml would otherwise be a .yml document handled by the LLM.
     if is_package_manifest_path(path):
         return extract_package_manifest
-    # `.h` is C/C++/ObjC-ambiguous; route Objective-C headers to extract_objc
-    # (the suffix map sends `.h` to extract_c, which can't read @interface etc.).
-    if path.suffix == ".h" and _is_objc_header(path):
-        return extract_objc
+    # `.h` is C/C++/ObjC-ambiguous; route Objective-C headers to extract_objc and
+    # C++/UE headers to extract_cpp (the suffix map sends `.h` to extract_c, which
+    # reads neither @interface nor class/struct/method/field). ObjC is checked
+    # first; plain C headers fall through to extract_c via the suffix map.
+    if path.suffix == ".h":
+        if _is_objc_header(path):
+            return extract_objc
+        if _is_cpp_header(path):
+            return extract_cpp
     return _DISPATCH.get(path.suffix)
 
 

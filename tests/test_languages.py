@@ -227,6 +227,331 @@ def test_cpp_struct_inherits_edge():
     assert found, "RetryingHttpClient (struct) should have inherits edge to HttpClient"
 
 
+# ── C++ / Unreal header + cross-file fixes ─────────────────────────────────────
+# Unreal declares every class/struct/method/field in the .h and defines methods
+# out-of-line in the .cpp. These guard the four C++ extraction fixes: header
+# routing, out-of-line method linking, cross-file member calls, and enums.
+
+def test_cpp_header_dispatch_routes_cpp_not_c(tmp_path):
+    """A C++/UE `.h` (class/UCLASS/`::`) routes to extract_cpp; a plain kernel-style
+    C `.h` stays on extract_c so the C++ grammar never chokes on it."""
+    from graphify.extract import _get_extractor, extract_cpp as _ecpp, extract_c as _ec
+    ue_h = tmp_path / "Foo.h"
+    ue_h.write_text(
+        "#pragma once\nUCLASS()\nclass MYGAME_API UFoo : public UObject {\n"
+        "    GENERATED_BODY()\n    void Bar();\n};\n"
+    )
+    plain_cpp_h = tmp_path / "widget.h"
+    plain_cpp_h.write_text("namespace ui {\nclass Widget { public: void draw(); };\n}\n")
+    kernel_h = tmp_path / "list.h"
+    kernel_h.write_text(
+        "#include <stddef.h>\nstruct list_head { struct list_head *next; };\n"
+        "int list_add(struct list_head *n);\n"
+    )
+    assert _get_extractor(ue_h) is _ecpp
+    assert _get_extractor(plain_cpp_h) is _ecpp
+    assert _get_extractor(kernel_h) is _ec
+
+
+def test_cpp_ue_header_extracts_class_and_fields(tmp_path):
+    """A UE header (export macro + UCLASS/UPROPERTY) must yield the class node,
+    its base, and its data member despite the tree-sitter-cpp macro hurdles."""
+    from graphify.extract import extract_cpp
+    p = tmp_path / "Foo.h"
+    p.write_text(
+        "#pragma once\nUCLASS(BlueprintType)\n"
+        "class MYGAME_API UFoo : public UObject {\n"
+        "    GENERATED_BODY()\n"
+        "public:\n"
+        "    UPROPERTY() TObjectPtr<UInventoryComponent> Inventory;\n"
+        "};\n"
+    )
+    r = extract_cpp(p)
+    assert "error" not in r
+    labels = {n["label"] for n in r["nodes"]}
+    assert "UFoo" in labels
+    assert ("UFoo", "UObject") in _edge_labels(r, "inherits")
+    assert ("UFoo", "Inventory") in _edge_labels(r, "defines", "field")
+
+
+def test_cpp_enum_class_case_of(tmp_path):
+    """`enum class` (and its enumerators) must produce an enum node with case_of edges."""
+    from graphify.extract import extract_cpp
+    p = tmp_path / "Types.h"
+    p.write_text(
+        "#pragma once\nUENUM(BlueprintType)\n"
+        "enum class EItemType : uint8 { Weapon, Armor, Consumable };\n"
+    )
+    r = extract_cpp(p)
+    labels = {n["label"] for n in r["nodes"]}
+    assert "EItemType" in labels
+    cases = _edge_labels(r, "case_of")
+    assert ("EItemType", "Weapon") in cases
+    assert ("EItemType", "Armor") in cases
+    assert ("EItemType", "Consumable") in cases
+
+
+def _cpp_split_pair(tmp_path):
+    """A realistic UE split pair + a consumer class, for the cross-file tests."""
+    (tmp_path / "InventoryComponent.h").write_text(
+        "#pragma once\nUCLASS()\n"
+        "class MYGAME_API UInventoryComponent : public UActorComponent {\n"
+        "    GENERATED_BODY()\npublic:\n    UFUNCTION() void AddItem(int32 Count);\n};\n"
+    )
+    (tmp_path / "InventoryComponent.cpp").write_text(
+        "#include \"InventoryComponent.h\"\n"
+        "void UInventoryComponent::AddItem(int32 Count) { }\n"
+    )
+    (tmp_path / "Foo.h").write_text(
+        "#pragma once\nUCLASS()\nclass MYGAME_API UFoo : public UObject {\n"
+        "    GENERATED_BODY()\n"
+        "    UPROPERTY() TObjectPtr<UInventoryComponent> Inventory;\n"
+        "    void UseInv();\n    void Other();\n};\n"
+    )
+    (tmp_path / "Foo.cpp").write_text(
+        "#include \"Foo.h\"\n"
+        "void UFoo::UseInv() {\n"
+        "    Inventory->AddItem(5);\n"
+        "    this->Other();\n"
+        "    UInventoryComponent* Local = GetOwner()->FindComponentByClass<UInventoryComponent>();\n"
+        "    Local->AddItem(1);\n"
+        "}\n"
+        "void UFoo::Other() { }\n"
+    )
+    return [
+        tmp_path / "InventoryComponent.h", tmp_path / "InventoryComponent.cpp",
+        tmp_path / "Foo.h", tmp_path / "Foo.cpp",
+    ]
+
+
+def test_cpp_out_of_line_methods_link_to_class(tmp_path):
+    """Out-of-line definitions (`void UFoo::UseInv() {}` in the .cpp) must be linked
+    to their class (declared in the .h) via a `method` edge."""
+    from graphify.extract import extract
+    r = extract(_cpp_split_pair(tmp_path), parallel=False)
+    methods = _edge_labels(r, "method")
+    assert ("UFoo", "UFoo::UseInv") in methods
+    assert ("UFoo", "UFoo::Other") in methods
+    assert ("UInventoryComponent", "UInventoryComponent::AddItem") in methods
+
+
+def test_cpp_cross_file_member_calls_resolve(tmp_path):
+    """Member calls through a typed field / local / `this` / template resolve to the
+    real method in another file (`Inventory->AddItem`, `Local->AddItem`,
+    `this->Other`, `FindComponentByClass<T>`)."""
+    from graphify.extract import extract
+    r = extract(_cpp_split_pair(tmp_path), parallel=False)
+    calls = _calls(r)
+    # this->Other() and the typed Inventory/Local member calls all resolve.
+    assert ("UFoo::UseInv()", "UFoo::Other()") in calls
+    assert ("UFoo::UseInv()", "UInventoryComponent::AddItem()") in calls
+    # FindComponentByClass<UInventoryComponent> is a strong component-use signal.
+    comp_refs = _edge_labels(r, "references", "component")
+    assert ("UFoo::UseInv", "UInventoryComponent") in comp_refs
+    # No dangling edges introduced by the new passes.
+    nids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        if e["relation"] in ("imports", "imports_from", "re_exports"):
+            continue
+        assert e["source"] in nids and e["target"] in nids
+
+
+def test_cpp_kernel_header_still_c(tmp_path):
+    """A Linux-kernel-style C header (C++ keywords as identifiers, `struct X { ... }`
+    with no base) must still route to extract_c, not the C++ grammar that chokes on
+    it. A function *definition* in it extracts cleanly via the C extractor."""
+    from graphify.extract import _get_extractor, extract_c
+    p = tmp_path / "sched.h"
+    p.write_text(
+        "#include <stddef.h>\n"
+        "struct task { int priority; void *private; };\n"
+        "static inline int schedule(struct task *t) { return t->priority; }\n"
+    )
+    assert _get_extractor(p) is extract_c
+    r = extract_c(p)
+    assert "error" not in r
+    assert "schedule()" in {n["label"] for n in r["nodes"]}
+
+
+def test_cpp_ue_macro_unbalanced_paren_in_string(tmp_path):
+    """An unbalanced `(` inside a UPROPERTY meta string (`ToolTip="Press ( to open"`)
+    must not derail the macro-blanking paren scan; every member after the macro
+    still extracts (F1 regression)."""
+    from graphify.extract import extract_cpp
+    p = tmp_path / "Foo.h"
+    p.write_text(
+        "#pragma once\nUCLASS()\n"
+        "class MYGAME_API UFoo : public UObject {\n"
+        "    GENERATED_BODY()\npublic:\n"
+        '    UPROPERTY(EditAnywhere, meta=(ToolTip="Press ( to open"))\n'
+        "    TObjectPtr<UInventoryComponent> Inventory;\n"
+        "    UFUNCTION()\n"
+        "    void After() { }\n"
+        "};\n"
+    )
+    r = extract_cpp(p)
+    assert "error" not in r
+    labels = {n["label"] for n in r["nodes"]}
+    assert "UFoo" in labels
+    assert ("UFoo", "Inventory") in _edge_labels(r, "defines", "field")
+    assert ("UFoo", "After") in _edge_labels(r, "method")
+
+
+def test_cpp_ue_macro_close_paren_in_comment(tmp_path):
+    """A `)` inside a comment within the macro's argument list must not close the
+    paren scan early; the following members still extract (F1 regression)."""
+    from graphify.extract import extract_cpp
+    p = tmp_path / "Foo.h"
+    p.write_text(
+        "#pragma once\nUCLASS()\n"
+        "class MYGAME_API UFoo : public UObject {\n"
+        "    GENERATED_BODY()\npublic:\n"
+        "    UPROPERTY(EditAnywhere /* smile :) */, meta=(ClampMin=\"0\"))\n"
+        "    TObjectPtr<UInventoryComponent> Inventory;\n"
+        "    UFUNCTION()\n"
+        "    void After() { }\n"
+        "};\n"
+    )
+    r = extract_cpp(p)
+    assert "error" not in r
+    assert ("UFoo", "Inventory") in _edge_labels(r, "defines", "field")
+    assert ("UFoo", "After") in _edge_labels(r, "method")
+
+
+def test_cpp_ue_macro_name_inside_string_not_blanked(tmp_path):
+    """A macro name inside a string literal (`"UFUNCTION("`) is not a live macro:
+    the literal stays intact, only the real macro is blanked, and members after
+    both still extract (F1 regression)."""
+    from graphify.extract import _preprocess_cpp_source, extract_cpp
+    src = (
+        b'const char* Doc = "UFUNCTION(BlueprintCallable)";\n'
+        b"UFUNCTION()\nvoid Real();\n"
+    )
+    out = _preprocess_cpp_source(src)
+    assert b'"UFUNCTION(BlueprintCallable)"' in out  # literal untouched
+    assert out.count(b"UFUNCTION") == 1              # real macro blanked
+    p = tmp_path / "Foo.h"
+    p.write_text(
+        "#pragma once\nUCLASS()\n"
+        "class MYGAME_API UFoo : public UObject {\n"
+        "    GENERATED_BODY()\npublic:\n"
+        '    static constexpr const char* Doc = "UFUNCTION(BlueprintCallable)";\n'
+        "    UFUNCTION()\n"
+        "    void After() { }\n"
+        "};\n"
+    )
+    r = extract_cpp(p)
+    assert "error" not in r
+    assert ("UFoo", "After") in _edge_labels(r, "method")
+
+
+def test_cpp_raw_string_literal_not_blanked(tmp_path):
+    """A multi-line raw string literal whose body mentions UE syntax (`_API`,
+    `UPROPERTY(`) must be left byte-identical by the preprocessing pass: the naive
+    per-line string scanner treated the body lines as code, blanked inside the
+    literal, ate the closing `)"`, and turned the whole file into a silent
+    zero-node extraction (F1 fast-follow regression)."""
+    from graphify.extract import _preprocess_cpp_source, extract_cpp
+    src = (
+        'const char* Tmpl = R"(\n'
+        "class MYGAME_API UGenerated : public UObject {\n"
+        "    UPROPERTY(EditAnywhere)\n"
+        "    int32 Value;\n"
+        "};\n"
+        ')";\n'
+        "void FGen::Emit() { }\n"
+        "void FGen::Flush() { }\n"
+    )
+    # Every macro mention is inside the raw string: preprocessing is a no-op.
+    assert _preprocess_cpp_source(src.encode()) == src.encode()
+    p = tmp_path / "Gen.cpp"
+    p.write_text(src)
+    r = extract_cpp(p)
+    assert "error" not in r
+    labels = {n["label"] for n in r["nodes"]}
+    assert "FGen::Emit()" in labels and "FGen::Flush()" in labels
+    # Delimited + prefixed form (u8R"md(...)md") containing `)"` inside the body:
+    # the literal survives and the real macro after it is still blanked.
+    src2 = (
+        b'const char* T = u8R"md(\nUPROPERTY(meta=")")\n)md";\n'
+        b"UFUNCTION()\nvoid Real() { }\n"
+    )
+    out2 = _preprocess_cpp_source(src2)
+    assert b'UPROPERTY(meta=")")' in out2   # literal untouched
+    assert out2.count(b"UFUNCTION") == 0    # live macro blanked
+
+
+def test_cpp_digit_separator_is_not_a_char_literal(tmp_path):
+    """A C++14 digit separator (`1'000'000`) must not open a char-literal scan that
+    masks the following code from the macro-blanking pass."""
+    from graphify.extract import extract_cpp
+    p = tmp_path / "Big.h"
+    p.write_text(
+        "#pragma once\nUCLASS()\n"
+        "class MYGAME_API UBig : public UObject {\n"
+        "    GENERATED_BODY()\npublic:\n"
+        "    static constexpr int64 Max = 1'000'000;\n"
+        "    UFUNCTION()\n"
+        "    void After() { }\n"
+        "};\n"
+    )
+    r = extract_cpp(p)
+    assert "error" not in r
+    assert ("UBig", "After") in _edge_labels(r, "method")
+
+
+def test_cpp_header_sniff_ignores_comments_and_strings(tmp_path):
+    """A plain C header whose only C++-ish content lives in comments/strings
+    (`/* virtual address */`, `"::1"`) must stay on extract_c (F2 regression)."""
+    from graphify.extract import _get_extractor, extract_c
+    p = tmp_path / "vm.h"
+    p.write_text(
+        "/* map a virtual address into the page table */\n"
+        '#define LOOPBACK6 "::1"\n'
+        "// a C++-style comment mentioning class Foo : public Bar\n"
+        "int map_page(unsigned long addr);\n"
+    )
+    assert _get_extractor(p) is extract_c
+
+
+def test_cpp_forward_declarations_do_not_create_nodes(tmp_path):
+    """Bodyless forward declarations (`enum class EItemType : uint8;`,
+    `class UOther;`) must not mint sourced definition nodes: a second sourced node
+    would trip the single-definition god-node guard and silently disable type
+    resolution against the real definition (F5 regression)."""
+    from graphify.extract import extract, extract_cpp
+    (tmp_path / "Types.h").write_text(
+        "#pragma once\nUENUM(BlueprintType)\n"
+        "enum class EItemType : uint8 { Weapon, Armor };\n"
+    )
+    (tmp_path / "User.h").write_text(
+        "#pragma once\n"
+        "enum class EItemType : uint8;\n"   # forward decl of the enum
+        "class UOther;\n"                    # forward decl of a class
+        "UCLASS()\nclass MYGAME_API UUser : public UObject {\n"
+        "    GENERATED_BODY()\n    void Use();\n};\n"
+    )
+    (tmp_path / "User.cpp").write_text(
+        '#include "User.h"\nvoid UUser::Use() { }\n'
+    )
+    # Per-file: the forward decls alone produce no class/enum nodes.
+    solo = extract_cpp(tmp_path / "User.h")
+    solo_labels = {n["label"] for n in solo["nodes"]}
+    assert "EItemType" not in solo_labels
+    assert "UOther" not in solo_labels
+    # Corpus: exactly one sourced EItemType (the real definition), cases intact,
+    # and out-of-line method linking (resolve_class) still works.
+    r = extract(
+        [tmp_path / "Types.h", tmp_path / "User.h", tmp_path / "User.cpp"],
+        parallel=False,
+    )
+    eitem = [n for n in r["nodes"] if n.get("label") == "EItemType" and n.get("source_file")]
+    assert len(eitem) == 1, [n for n in r["nodes"] if n.get("label") == "EItemType"]
+    cases = _edge_labels(r, "case_of")
+    assert ("EItemType", "Weapon") in cases and ("EItemType", "Armor") in cases
+    assert ("UUser", "UUser::Use") in _edge_labels(r, "method")
+
+
 # ── CUDA ──────────────────────────────────────────────────────────────────────
 # CUDA is a C++ superset, so .cu/.cuh route through the C++ (tree-sitter-cpp)
 # extractor. These tests guard that __global__/__device__ kernels, host
