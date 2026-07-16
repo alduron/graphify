@@ -130,6 +130,14 @@ _GENERIC_KEYWORD_PATTERNS = [
 # which runs before word counting).
 _WORD_SPLIT = re.compile(r'[-_\s]+')
 
+# Data/config extensions inside CODE_EXTENSIONS that can legitimately embed literal secret
+# VALUES (credentials.json, prod.tfvars), so the generic keyword heuristic must still guard
+# them. Every OTHER code extension is a programming-language source file, where a name like
+# refresh_token.py / oauth_token.ts / secret_manager.go is code that HANDLES a secret, not a
+# secret store -- exempting those from Stage 3 keeps real symbols in the graph (#-, an ORM
+# refresh-token model was being silently dropped because its filename ended in "token").
+_SECRETY_DATA_EXTENSIONS = frozenset({'.json', '.tf', '.tfvars', '.hcl'})
+
 
 def _generic_keyword_hit(name: str) -> bool:
     """True if a generic secret keyword appears load-bearing in the filename.
@@ -184,7 +192,15 @@ def _is_sensitive(path: Path) -> bool:
     name = path.name
     if any(p.search(name) for p in _SENSITIVE_PATTERNS):
         return True
-    # Stage 3: generic keywords, only when load-bearing in the name
+    # Stage 3: generic keywords, only when load-bearing in the name -- but NEVER for a
+    # programming-language source file. A code file named refresh_token.py / oauth_token.ts /
+    # secret_manager.go is source that HANDLES a secret, not a secret STORE; silently dropping
+    # it deletes real symbols from the graph. Data/config formats that can embed literal secret
+    # values (credentials.json, prod.tfvars) stay guarded, as do all non-code files (.env, .pem,
+    # token.txt) caught by Stage 1/2 or falling through here.
+    ext = path.suffix.lower()
+    if ext in CODE_EXTENSIONS and ext not in _SECRETY_DATA_EXTENSIONS:
+        return False
     return _generic_keyword_hit(name)
 
 

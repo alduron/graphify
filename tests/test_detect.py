@@ -787,9 +787,22 @@ def test_sensitive_does_not_flag_tokenizer_py():
 def test_sensitive_does_not_flag_tokenize_py():
     assert not _is_sensitive(Path("tokenize.py"))
 
-def test_sensitive_flags_passwords_py():
-    # passwords.py is just as likely a secret store as passwords.txt — code ext is no excuse
-    assert _is_sensitive(Path("passwords.py"))
+def test_sensitive_source_files_are_indexed_not_skipped():
+    # A programming-language source file whose name ends in a secret keyword is code that
+    # HANDLES a secret, not a secret STORE: structure extraction captures its symbol names, not
+    # literal values, and silently dropping it deletes real symbols from the graph (an ORM
+    # refresh-token model vanished this way). The generic-keyword heuristic must exempt source.
+    assert not _is_sensitive(Path("api/src/models/refresh_token.py"))
+    assert not _is_sensitive(Path("oauth_token.ts"))
+    assert not _is_sensitive(Path("internal/secret_manager.go"))
+    assert not _is_sensitive(Path("passwords.py"))  # a password-validator module is source, index it
+
+def test_sensitive_data_formats_stay_guarded():
+    # Data/config formats that live in CODE_EXTENSIONS can still embed literal secret VALUES, so
+    # the keyword heuristic keeps guarding them even though they take the AST path.
+    assert _is_sensitive(Path("config/credentials.json"))
+    assert _is_sensitive(Path("deploy/secrets.tf"))
+    assert _is_sensitive(Path("infra/token.tfvars"))
 
 def test_sensitive_flags_ssh_dir():
     assert _is_sensitive(Path("/home/user/.ssh/id_rsa"))
