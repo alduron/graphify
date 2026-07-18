@@ -2450,6 +2450,7 @@ _JS_CONFIG = LanguageConfig(
     call_function_field="function",
     call_accessor_node_types=frozenset({"member_expression"}),
     call_accessor_field="property",
+    call_accessor_object_field="object",
     function_boundary_types=frozenset({"function_declaration", "arrow_function", "method_definition"}),
     import_handler=_import_js,
 )
@@ -2470,6 +2471,7 @@ _TS_CONFIG = LanguageConfig(
     call_function_field="function",
     call_accessor_node_types=frozenset({"member_expression"}),
     call_accessor_field="property",
+    call_accessor_object_field="object",
     function_boundary_types=frozenset({"function_declaration", "arrow_function", "method_definition"}),
     import_handler=_import_js,
 )
@@ -2488,6 +2490,7 @@ _TSX_CONFIG = LanguageConfig(
     call_function_field=_TS_CONFIG.call_function_field,
     call_accessor_node_types=_TS_CONFIG.call_accessor_node_types,
     call_accessor_field=_TS_CONFIG.call_accessor_field,
+    call_accessor_object_field=_TS_CONFIG.call_accessor_object_field,
     function_boundary_types=_TS_CONFIG.function_boundary_types,
     import_handler=_TS_CONFIG.import_handler,
 )
@@ -2842,6 +2845,456 @@ def _ruby_local_class_bindings(body_node, source: bytes) -> dict[str, str | None
     return bindings
 
 
+def _python_self_target(node, source: bytes) -> str | None:
+    """Return the field name if ``node`` is a ``self.<name>`` attribute (a plain
+    attribute of a bare ``self`` identifier), else None. A chained receiver
+    (``self.a.b``) is not a self-field target and intentionally returns None.
+    """
+    if node is None or node.type != "attribute":
+        return None
+    obj = node.child_by_field_name("object")
+    attr = node.child_by_field_name("attribute")
+    if obj is None or obj.type != "identifier" or _read_text(obj, source) != "self":
+        return None
+    return _read_text(attr, source) if attr is not None else None
+
+
+def _python_single_type_ref(type_node, source: bytes) -> str | None:
+    """Return the lone concrete type name from a Python annotation node, or
+    None when absent, a container (``Optional[T]``/``List[T]``), or ambiguous.
+
+    A wrapped generic surfaces its argument with role ``generic_arg`` via
+    ``_python_collect_type_refs``, which this intentionally ignores: only an
+    unwrapped, unambiguous annotation counts as a 100%-confidence type.
+    """
+    if type_node is None:
+        return None
+    refs: list[tuple[str, str]] = []
+    _python_collect_type_refs(type_node, source, False, refs)
+    types = [name for name, role in refs if role == "type"]
+    return types[0] if len(types) == 1 else None
+
+
+def _python_new_class_name(node, source: bytes) -> str | None:
+    """Return ``ClassName`` if ``node`` is a ``ClassName(...)`` constructor call
+    (simple identifier callee, capitalized), else None.
+
+    Mirrors the capitalized-receiver convention the qualified-call resolver
+    uses to distinguish a class reference from an instance/builtin call.
+    """
+    if node is None or node.type != "call":
+        return None
+    func = node.child_by_field_name("function")
+    if func is None or func.type != "identifier":
+        return None
+    name = _read_text(func, source)
+    if name and name[:1].isupper() and name not in _LANGUAGE_BUILTIN_GLOBALS:
+        return name
+    return None
+
+
+def _python_param_types(params_node, source: bytes) -> dict[str, str]:
+    """Map ``param_name -> TypeName`` for typed parameters (single, unwrapped
+    annotations only) under a Python ``parameters`` node."""
+    out: dict[str, str] = {}
+    if params_node is None:
+        return out
+    for child in params_node.children:
+        if child.type not in ("typed_parameter", "typed_default_parameter"):
+            continue
+        name_node = next((c for c in child.children if c.type == "identifier"), None)
+        if name_node is None:
+            continue
+        type_name = _python_single_type_ref(child.child_by_field_name("type"), source)
+        if type_name:
+            out[_read_text(name_node, source)] = type_name
+    return out
+
+
+def _python_local_var_types(
+    body_node, source: bytes, param_types: dict[str, str]
+) -> dict[str, str | None]:
+    """Map ``local_var -> ClassName`` within one Python function body, mirroring
+    ``_ruby_local_class_bindings``'s 100%-confidence contract: a name bound to
+    more than one type (or reassigned to something untyped) maps to None so a
+    member call on it is never resolved. Seeded from the function's own typed
+    parameters, a single, certain binding unless the body itself reassigns
+    the name to something else.
+
+    Does not descend into a nested function/lambda; that is a separate scope.
+    """
+    bindings: dict[str, str | None] = dict(param_types)
+    boundary = {"function_definition", "lambda"}
+
+    def rebind(var: str, cls: str | None) -> None:
+        if cls is None:
+            if var in bindings:
+                bindings[var] = None
+        elif var in bindings:
+            if bindings[var] != cls:
+                bindings[var] = None
+        else:
+            bindings[var] = cls
+
+    def visit(n) -> None:
+        for child in n.children:
+            if child.type in boundary:
+                continue
+            if child.type == "assignment":
+                left = child.child_by_field_name("left")
+                if left is not None and left.type == "identifier":
+                    var = _read_text(left, source)
+                    type_node = child.child_by_field_name("type")
+                    cls = _python_single_type_ref(type_node, source) if type_node is not None else None
+                    if cls is None:
+                        cls = _python_new_class_name(child.child_by_field_name("right"), source)
+                    rebind(var, cls)
+            visit(child)
+
+    visit(body_node)
+    return bindings
+
+
+def _python_walk_self_assignments(body_node, source: bytes, param_types: dict[str, str], rebind) -> None:
+    """Walk one Python function body, calling ``rebind(field, cls_or_None)`` for
+    every ``self.<field>`` assignment: annotated (``self.x: T``), constructor-via-
+    new (``self.x = T(...)``), or constructor-via-param (``self.x = param`` where
+    ``param`` is typed in this function's own signature, given via ``param_types``).
+
+    Does not descend into a nested function/lambda; that is a separate scope.
+    """
+    boundary = {"function_definition", "lambda"}
+
+    def visit(n) -> None:
+        for child in n.children:
+            if child.type in boundary:
+                continue
+            if child.type == "assignment":
+                left = child.child_by_field_name("left")
+                field = _python_self_target(left, source) if left is not None else None
+                if field:
+                    type_node = child.child_by_field_name("type")
+                    cls = _python_single_type_ref(type_node, source) if type_node is not None else None
+                    if cls is None:
+                        right = child.child_by_field_name("right")
+                        cls = _python_new_class_name(right, source)
+                        if cls is None and right is not None and right.type == "identifier":
+                            cls = param_types.get(_read_text(right, source))
+                    rebind(field, cls)
+            visit(child)
+
+    visit(body_node)
+
+
+def _python_collect_self_field_types(root, source: bytes) -> dict[str, dict[str, str]]:
+    """Map ``ClassName -> {field_name: TypeName}`` from ``self.<field>``
+    bindings across a class's own method bodies, plus class-body-level typed
+    field declarations (``field: T`` directly in the class body, the common
+    dataclass-style spelling of an instance field's type).
+
+    Same 100%-confidence contract as ``_python_local_var_types``: a field bound
+    to more than one type across the class's methods maps to None and is
+    dropped. Threaded out to ``_resolve_python_member_calls`` (as
+    ``python_field_types``) so ``self.field.method()`` resolves cross-file.
+    """
+    out: dict[str, dict[str, str]] = {}
+
+    def visit_class(class_node) -> None:
+        name_node = class_node.child_by_field_name("name")
+        body = class_node.child_by_field_name("body")
+        if name_node is None or body is None:
+            return
+        class_name = _read_text(name_node, source)
+        fields: dict[str, str | None] = {}
+
+        def rebind(field: str, cls: str | None) -> None:
+            if cls is None:
+                if field in fields:
+                    fields[field] = None
+            elif field in fields:
+                if fields[field] != cls:
+                    fields[field] = None
+            else:
+                fields[field] = cls
+
+        for member in body.children:
+            if member.type == "expression_statement":
+                for stmt in member.children:
+                    if stmt.type != "assignment":
+                        continue
+                    left = stmt.child_by_field_name("left")
+                    if left is None or left.type != "identifier":
+                        continue
+                    type_name = _python_single_type_ref(stmt.child_by_field_name("type"), source)
+                    if type_name:
+                        rebind(_read_text(left, source), type_name)
+            elif member.type == "function_definition":
+                params_node = member.child_by_field_name("parameters")
+                method_body = member.child_by_field_name("body")
+                if method_body is None:
+                    continue
+                _python_walk_self_assignments(
+                    method_body, source, _python_param_types(params_node, source), rebind
+                )
+        resolved = {k: v for k, v in fields.items() if v is not None}
+        if resolved:
+            out[class_name] = resolved
+
+    def visit(n) -> None:
+        if n.type == "class_definition":
+            visit_class(n)
+        for c in n.children:
+            visit(c)
+
+    visit(root)
+    return out
+
+
+def _js_this_target(node, source: bytes) -> str | None:
+    """Return the field name if ``node`` is a ``this.<name>`` member_expression
+    (bare ``this`` object, simple property), else None. A chained receiver
+    (``this.a.b``) is not a this-field target and intentionally returns None.
+    Mirrors ``_python_self_target``.
+    """
+    if node is None or node.type != "member_expression":
+        return None
+    obj = node.child_by_field_name("object")
+    prop = node.child_by_field_name("property")
+    if obj is None or obj.type != "this":
+        return None
+    return _read_text(prop, source) if prop is not None else None
+
+
+def _js_new_class_name(node, source: bytes) -> str | None:
+    """Return ``ClassName`` if ``node`` is a ``new ClassName(...)`` expression
+    with a simple-identifier constructor, else None.
+
+    Mirrors ``_python_new_class_name``; JS/TS's dedicated ``new_expression``
+    node makes the capitalized-name check Python needs (to disambiguate a
+    constructor call from a plain call, both spelled ``call``) unnecessary.
+    """
+    if node is None or node.type != "new_expression":
+        return None
+    ctor = node.child_by_field_name("constructor")
+    if ctor is None or ctor.type != "identifier":
+        return None
+    return _read_text(ctor, source)
+
+
+def _ts_single_type_ref(type_node, source: bytes) -> str | None:
+    """Return the lone concrete type name from a TS type annotation node, or
+    None when absent, a container/generic, or ambiguous. Mirrors
+    ``_python_single_type_ref``, reusing ``_ts_collect_type_refs``.
+    """
+    if type_node is None:
+        return None
+    refs: list[tuple[str, str]] = []
+    _ts_collect_type_refs(type_node, source, False, refs)
+    types = [name for name, role in refs if role == "type"]
+    return types[0] if len(types) == 1 else None
+
+
+def _js_param_types(params_node, source: bytes) -> dict[str, str]:
+    """Map ``param_name -> TypeName`` for typed parameters (single, unwrapped
+    annotations only) under a JS/TS ``formal_parameters`` node. Mirrors
+    ``_python_param_types``. Plain JS params carry no ``type`` field, so this
+    is naturally a no-op for ``.js`` files.
+    """
+    out: dict[str, str] = {}
+    if params_node is None:
+        return out
+    for child in params_node.children:
+        if child.type not in ("required_parameter", "optional_parameter"):
+            continue
+        name_node = child.child_by_field_name("pattern")
+        if name_node is None or name_node.type != "identifier":
+            continue
+        type_name = _ts_single_type_ref(child.child_by_field_name("type"), source)
+        if type_name:
+            out[_read_text(name_node, source)] = type_name
+    return out
+
+
+def _js_local_var_types(
+    body_node, source: bytes, param_types: dict[str, str]
+) -> dict[str, str | None]:
+    """Map ``local_var -> ClassName`` within one JS/TS function body, mirroring
+    ``_python_local_var_types``'s 100%-confidence contract: a name bound to
+    more than one type (or reassigned to something untyped) maps to None so a
+    member call on it is never resolved. Seeded from the function's own typed
+    parameters, a single, certain binding unless the body itself reassigns
+    the name to something else.
+
+    Sources: ``const/let/var x = new Thing()``, a TS ``let x: Thing``
+    declaration, and a later plain reassignment (``x = new Other()``) of an
+    already-tracked name.
+
+    Does not descend into a nested function; that is a separate scope.
+    """
+    bindings: dict[str, str | None] = dict(param_types)
+    boundary = {"function_declaration", "function_expression", "arrow_function", "method_definition"}
+
+    def rebind(var: str, cls: str | None) -> None:
+        if cls is None:
+            if var in bindings:
+                bindings[var] = None
+        elif var in bindings:
+            if bindings[var] != cls:
+                bindings[var] = None
+        else:
+            bindings[var] = cls
+
+    def visit(n) -> None:
+        for child in n.children:
+            if child.type in boundary:
+                continue
+            if child.type in ("lexical_declaration", "variable_declaration"):
+                for declarator in child.children:
+                    if declarator.type != "variable_declarator":
+                        continue
+                    name_node = declarator.child_by_field_name("name")
+                    if name_node is None or name_node.type != "identifier":
+                        continue
+                    var = _read_text(name_node, source)
+                    type_node = declarator.child_by_field_name("type")
+                    cls = _ts_single_type_ref(type_node, source) if type_node is not None else None
+                    if cls is None:
+                        cls = _js_new_class_name(declarator.child_by_field_name("value"), source)
+                    rebind(var, cls)
+            elif child.type == "assignment_expression":
+                left = child.child_by_field_name("left")
+                if left is not None and left.type == "identifier":
+                    var = _read_text(left, source)
+                    cls = _js_new_class_name(child.child_by_field_name("right"), source)
+                    rebind(var, cls)
+            visit(child)
+
+    visit(body_node)
+    return bindings
+
+
+# TS constructor "parameter properties" (`constructor(private x: Thing)`) carry
+# one of these modifiers; their presence is what distinguishes a plain typed
+# param from one that also declares (and assigns) a class field.
+_JS_PARAM_PROPERTY_MODIFIERS = frozenset({"accessibility_modifier", "readonly", "override_modifier"})
+
+
+def _js_is_parameter_property(param_node) -> bool:
+    """True if ``param_node`` (a TS ``required_parameter``/``optional_parameter``)
+    carries an accessibility/readonly modifier, i.e. is a constructor parameter
+    property that both declares and assigns a class field in one shot."""
+    return any(c.type in _JS_PARAM_PROPERTY_MODIFIERS for c in param_node.children)
+
+
+def _js_walk_this_assignments(body_node, source: bytes, param_types: dict[str, str], rebind) -> None:
+    """Walk one JS/TS method body, calling ``rebind(field, cls_or_None)`` for
+    every ``this.<field> = ...`` assignment: constructor-via-new
+    (``this.x = new T()``) or constructor-via-param (``this.x = param`` where
+    ``param`` is typed in this function's own signature, given via
+    ``param_types``). Mirrors ``_python_walk_self_assignments``.
+
+    Does not descend into a nested function; that is a separate scope.
+    """
+    boundary = {"function_declaration", "function_expression", "arrow_function", "method_definition"}
+
+    def visit(n) -> None:
+        for child in n.children:
+            if child.type in boundary:
+                continue
+            if child.type == "assignment_expression":
+                left = child.child_by_field_name("left")
+                field = _js_this_target(left, source) if left is not None else None
+                if field:
+                    right = child.child_by_field_name("right")
+                    cls = _js_new_class_name(right, source)
+                    if cls is None and right is not None and right.type == "identifier":
+                        cls = param_types.get(_read_text(right, source))
+                    rebind(field, cls)
+            visit(child)
+
+    visit(body_node)
+
+
+def _js_collect_this_field_types(root, source: bytes) -> dict[str, dict[str, str]]:
+    """Map ``ClassName -> {field_name: TypeName}`` from ``this.<field>``
+    bindings across a class's own method bodies, TS field-declaration
+    annotations (``private repo: Repo;``), and TS constructor parameter
+    properties (``constructor(private repo: Repo)``).
+
+    Same 100%-confidence contract as ``_js_local_var_types``: a field bound to
+    more than one type across the class's methods maps to None and is
+    dropped. Threaded out to ``_resolve_js_member_calls`` (as
+    ``js_field_types``) so ``this.field.method()`` resolves cross-file.
+    Mirrors ``_python_collect_self_field_types``.
+    """
+    out: dict[str, dict[str, str]] = {}
+
+    def visit_class(class_node) -> None:
+        name_node = class_node.child_by_field_name("name")
+        body = class_node.child_by_field_name("body")
+        if name_node is None or body is None:
+            return
+        class_name = _read_text(name_node, source)
+        fields: dict[str, str | None] = {}
+
+        def rebind(field: str, cls: str | None) -> None:
+            if cls is None:
+                if field in fields:
+                    fields[field] = None
+            elif field in fields:
+                if fields[field] != cls:
+                    fields[field] = None
+            else:
+                fields[field] = cls
+
+        for member in body.children:
+            if member.type in ("field_definition", "public_field_definition"):
+                name_node2 = (member.child_by_field_name("property")
+                              or member.child_by_field_name("name"))
+                if name_node2 is None:
+                    continue
+                field_name = _read_text(name_node2, source)
+                type_name = _ts_single_type_ref(member.child_by_field_name("type"), source)
+                if type_name is None:
+                    type_name = _js_new_class_name(member.child_by_field_name("value"), source)
+                if field_name and type_name:
+                    rebind(field_name, type_name)
+            elif member.type == "method_definition":
+                params_node = member.child_by_field_name("parameters")
+                # TS constructor parameter properties declare AND assign a
+                # field in one shot; fold them into the same field table.
+                if params_node is not None:
+                    for p in params_node.children:
+                        if p.type not in ("required_parameter", "optional_parameter"):
+                            continue
+                        if not _js_is_parameter_property(p):
+                            continue
+                        pname_node = p.child_by_field_name("pattern")
+                        if pname_node is None or pname_node.type != "identifier":
+                            continue
+                        type_name = _ts_single_type_ref(p.child_by_field_name("type"), source)
+                        if type_name:
+                            rebind(_read_text(pname_node, source), type_name)
+                method_body = member.child_by_field_name("body")
+                if method_body is None:
+                    continue
+                _js_walk_this_assignments(
+                    method_body, source, _js_param_types(params_node, source), rebind
+                )
+        resolved = {k: v for k, v in fields.items() if v is not None}
+        if resolved:
+            out[class_name] = resolved
+
+    def visit(n) -> None:
+        if n.type in ("class_declaration", "abstract_class_declaration"):
+            visit_class(n)
+        for c in n.children:
+            visit(c)
+
+    visit(root)
+    return out
+
+
 # ── Generic extractor ─────────────────────────────────────────────────────────
 
 def _extract_generic(
@@ -2906,6 +3359,12 @@ def _extract_generic(
     # resolved to the receiver's real definition in _resolve_swift_member_calls.
     # C++ reuses this table (member fields + local vars) as `cpp_type_table`.
     type_table: dict[str, str] = {}
+    # Python: func_nid -> its `parameters` node, captured while walking so the
+    # call-graph pass below can seed each function's local-var/self-field type
+    # tables from its own signature (instance member-call resolution).
+    python_func_params: dict[str, object] = {}
+    # JS/TS mirror of python_func_params (typed params only meaningful for TS).
+    js_func_params: dict[str, object] = {}
 
     csharp_interface_names: set[str] = set()
     if config.ts_module == "tree_sitter_c_sharp":
@@ -3058,6 +3517,38 @@ def _extract_generic(
                                     })
                                     seen_ids.add(base_nid)
                             add_edge(class_nid, base_nid, "inherits", line)
+
+            # JS/JSX-specific: `class Sub extends Base`. Plain JS has no
+            # _SymbolResolutionFacts pass, so its class_heritage inheritance is
+            # emitted here (TS/TSX go through _ts_walk_class_members instead).
+            if config.ts_module == "tree_sitter_javascript":
+                for child in node.children:
+                    if child.type != "class_heritage":
+                        continue
+                    base = None
+                    for sub in child.children:
+                        if sub.type == "identifier":
+                            base = _read_text(sub, source)
+                            break
+                        if sub.type == "member_expression":
+                            prop = sub.child_by_field_name("property")
+                            base = _read_text(prop, source) if prop is not None else None
+                            break
+                    if not base:
+                        continue
+                    base_nid = _make_id(stem, base)
+                    if base_nid not in seen_ids:
+                        base_nid = _make_id(base)
+                        if base_nid not in seen_ids:
+                            nodes.append({
+                                "id": base_nid,
+                                "label": base,
+                                "file_type": "code",
+                                "source_file": "",
+                                "source_location": "",
+                            })
+                            seen_ids.add(base_nid)
+                    add_edge(class_nid, base_nid, "inherits", line)
 
             # Swift-specific: conformance / inheritance
             if config.ts_module == "tree_sitter_swift":
@@ -3739,6 +4230,7 @@ def _extract_generic(
 
             if config.ts_module == "tree_sitter_python":
                 params_node = node.child_by_field_name("parameters")
+                python_func_params[func_nid] = params_node
                 for ref_name, role in _python_collect_param_refs(params_node, source):
                     ctx = "generic_arg" if role == "generic_arg" else "parameter_type"
                     target_nid = ensure_named_node(ref_name, line)
@@ -3757,6 +4249,13 @@ def _extract_generic(
                             edges.append(
                                 _semantic_reference_edge(func_nid, target_nid, ctx, str_path, line)
                             )
+
+            if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+                # Mirror python_func_params: seeds the call-graph pass below so
+                # `receiver_type`/`self_field` member-call resolution can read
+                # this function's own typed parameters (TS only; JS params
+                # carry no type annotation, so this is a no-op there).
+                js_func_params[func_nid] = node.child_by_field_name("parameters")
 
             if config.ts_module == "tree_sitter_c_sharp":
                 params_node = node.child_by_field_name("parameters")
@@ -4075,6 +4574,15 @@ def _extract_generic(
     # populated before walk_calls runs. Lets member-call raw_calls carry a
     # receiver_type so the cross-file pass resolves `var.method` by type (#ruby).
     ruby_var_types: dict[str, dict[str, str | None]] = {}
+    # Python: per-function `local_var -> ClassName` table (mirrors ruby_var_types)
+    # plus a per-class `self.field -> ClassName` table, both populated before
+    # walk_calls runs so instance member-call raw_calls can carry receiver_type
+    # / self_field for cross-file resolution in _resolve_python_member_calls.
+    python_var_types: dict[str, dict[str, str | None]] = {}
+    python_field_types: dict[str, dict[str, str]] = {}
+    # JS/TS mirror of python_var_types / python_field_types.
+    js_var_types: dict[str, dict[str, str | None]] = {}
+    js_field_types: dict[str, dict[str, str]] = {}
 
     def _php_class_const_scope(n) -> str | None:
         scope = n.child_by_field_name("scope")
@@ -4113,6 +4621,7 @@ def _extract_generic(
             cpp_receiver: str | None = None
             cpp_receiver_is_type: bool = False
             cpp_template_arg: str | None = None
+            self_field: str | None = None
 
             # Special handling per language
             if config.ts_module == "tree_sitter_swift":
@@ -4276,6 +4785,22 @@ def _extract_generic(
                             obj = func_node.child_by_field_name(config.call_accessor_object_field)
                             if obj is not None and obj.type == "identifier":
                                 member_receiver = _read_text(obj, source)
+                            elif (obj is not None and obj.type == "attribute"
+                                  and config.ts_module == "tree_sitter_python"):
+                                # `self.repo.save()`: the object is itself an
+                                # attribute. Capture the compound self.<field>
+                                # receiver so cross-file resolution can look up
+                                # the field's type on the caller's own class.
+                                self_field = _python_self_target(obj, source)
+                            elif (obj is not None and obj.type == "member_expression"
+                                  and config.ts_module in (
+                                      "tree_sitter_javascript", "tree_sitter_typescript")):
+                                # `this.repo.save()`: the object is itself a
+                                # member_expression (this.repo). Capture the
+                                # compound this.<field> receiver so cross-file
+                                # resolution can look up the field's type on
+                                # the caller's own class.
+                                self_field = _js_this_target(obj, source)
                     else:
                         # Try reading the node directly (e.g. Java name field is the callee)
                         callee_name = _read_text(func_node, source)
@@ -4287,7 +4812,12 @@ def _extract_generic(
                 # viewset action delegates to a same-named service action — which would
                 # match `tgt_nid == caller_nid` and silently drop the call (#1446). The
                 # captured receiver is resolved later in _resolve_python_member_calls.
-                if is_member_call and member_receiver and member_receiver[:1].isupper():
+                # A `self.<field>.method()` compound receiver must defer too:
+                # the field's type is only knowable cross-file (constructor
+                # assignment or annotation elsewhere in the class), so an
+                # in-file bare-name guess here would risk the same
+                # tgt_nid == caller_nid drop or a wrong same-named method.
+                if is_member_call and ((member_receiver and member_receiver[:1].isupper()) or self_field):
                     tgt_nid = None
                 else:
                     tgt_nid = label_to_nid.get(callee_name)
@@ -4322,6 +4852,25 @@ def _extract_generic(
                         rc_entry["receiver_type"] = ruby_var_types.get(
                             caller_nid, {}
                         ).get(member_receiver)
+                    # Python: a compound self.<field> receiver defers entirely to
+                    # the caller's own class field table (self_field, looked up
+                    # cross-file); a plain-identifier receiver instead carries
+                    # its local-var/typed-param type, when known.
+                    if config.ts_module == "tree_sitter_python":
+                        if self_field:
+                            rc_entry["self_field"] = self_field
+                        elif member_receiver:
+                            rc_entry["receiver_type"] = python_var_types.get(
+                                caller_nid, {}
+                            ).get(member_receiver)
+                    # JS/TS mirrors the same self_field / receiver_type split.
+                    if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+                        if self_field:
+                            rc_entry["self_field"] = self_field
+                        elif member_receiver:
+                            rc_entry["receiver_type"] = js_var_types.get(
+                                caller_nid, {}
+                            ).get(member_receiver)
                     # C++: mark whether the receiver is an explicitly-named class
                     # (`UFoo::` scope) vs. an instance, and carry any template arg
                     # so _resolve_cpp_calls can type the receiver / link components.
@@ -4461,6 +5010,18 @@ def _extract_generic(
         for caller_nid, body_node in function_bodies:
             ruby_var_types[caller_nid] = _ruby_local_class_bindings(body_node, source)
 
+    if config.ts_module == "tree_sitter_python":
+        for caller_nid, body_node in function_bodies:
+            param_types = _python_param_types(python_func_params.get(caller_nid), source)
+            python_var_types[caller_nid] = _python_local_var_types(body_node, source, param_types)
+        python_field_types = _python_collect_self_field_types(root, source)
+
+    if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+        for caller_nid, body_node in function_bodies:
+            param_types = _js_param_types(js_func_params.get(caller_nid), source)
+            js_var_types[caller_nid] = _js_local_var_types(body_node, source, param_types)
+        js_field_types = _js_collect_this_field_types(root, source)
+
     for caller_nid, body_node in function_bodies:
         walk_calls(body_node, caller_nid)
 
@@ -4509,6 +5070,10 @@ def _extract_generic(
             result["cpp_type_table"] = {"path": str_path, "table": type_table}
         else:
             result["swift_type_table"] = {"path": str_path, "table": type_table}
+    if python_field_types:
+        result["python_field_types"] = {"path": str_path, "table": python_field_types}
+    if js_field_types:
+        result["js_field_types"] = {"path": str_path, "table": js_field_types}
     return result
 
 
@@ -10001,18 +10566,25 @@ def _resolve_python_member_calls(
     all_nodes: list[dict],
     all_edges: list[dict],
 ) -> None:
-    """Resolve cross-file Python qualified class-method calls (``ClassName.method()``)
-    to the class-qualified method node (#1446).
+    """Resolve cross-file Python member calls to the receiver's real class
+    method, extending the original qualified-class-method pass (#1446).
 
     The shared cross-file call pass drops every ``is_member_call`` because a bare
     method name (``log``) collides across the corpus and inflates god-nodes
-    (#543/#1219). That guard is right for *instance* calls (``obj.method()``) but
-    misses *class-qualified* calls (``ClassName.method()``), where the receiver is
-    an explicitly-named class — an exact, unambiguous reference. This pass uses the
-    receiver captured by the extractor, and when it is a capitalized name resolving
-    to exactly one class node that owns the called method, emits an EXTRACTED
-    ``calls`` edge. Purely additive (only member calls the shared pass skipped),
-    with a single-definition god-node guard.
+    (#543/#1219). That guard is right for a genuinely untyped receiver, but wrong
+    whenever the receiver's type is knowable:
+
+    * ``ClassName.method()`` (original #1446 path): the receiver names the class
+      explicitly in source -> EXTRACTED.
+    * a local variable or typed parameter (``repo = Repo()`` /
+      ``def f(self, repo: Repo)``) whose type the extractor stamped as
+      ``receiver_type`` on the raw call -> INFERRED.
+    * ``self.<field>.method()`` whose field type the extractor recorded on the
+      caller's own class (constructor assignment or annotation elsewhere in the
+      class), carried as ``self_field`` on the raw call -> INFERRED.
+
+    Every path shares the same single-definition god-node guard: an ambiguous
+    class name bails, and the resolved method must belong to that exact class.
 
     Must run after id-disambiguation so node ids and caller_nids are final.
     """
@@ -10022,10 +10594,12 @@ def _resolve_python_member_calls(
     node_by_id: dict[str, dict] = {n.get("id"): n for n in all_nodes}
 
     # A class owns methods: it is the source of one or more `method` edges. Index
-    # class label -> owning class node ids (len != 1 is the god-node guard), and
-    # (class_node_id, method_key) -> method_node_id.
+    # class label -> owning class node ids (len != 1 is the god-node guard),
+    # (class_node_id, method_key) -> method_node_id, and method_node_id -> its
+    # owning class_node_id (for a `self.<field>` receiver's enclosing class).
     class_def_nids: dict[str, list[str]] = {}
     method_index: dict[tuple[str, str], str] = {}
+    owner_class_of: dict[str, str] = {}
     for e in all_edges:
         if e.get("relation") != "method":
             continue
@@ -10036,53 +10610,337 @@ def _resolve_python_member_calls(
         tnode = node_by_id.get(tgt)
         if tnode is not None:
             method_index[(src, _key(tnode.get("label", "")))] = tgt
+        owner_class_of.setdefault(tgt, src)
+    # A method-less class (`class Repo(Base): pass`) owns no `method` edge and
+    # so is absent above; also index both ends of `inherits` so it still
+    # resolves as a receiver type for base-class method/field lookup.
+    for e in all_edges:
+        if e.get("relation") != "inherits":
+            continue
+        for nid in (e.get("source"), e.get("target")):
+            cnode = node_by_id.get(nid)
+            if cnode is not None:
+                class_def_nids.setdefault(_key(cnode.get("label", "")), []).append(nid)
     if not class_def_nids:
         return
     # A class with N methods produced N entries; collapse to a unique set.
     for k in list(class_def_nids):
         class_def_nids[k] = sorted(set(class_def_nids[k]))
 
+    def resolve_class(name: str | None) -> str | None:
+        if not name:
+            return None
+        defs = class_def_nids.get(_key(name), [])
+        return defs[0] if len(defs) == 1 else None
+
+    # class_label -> {field_name: TypeName}, keyed per source file. A Python
+    # class and its own methods are always emitted from the same file walk (a
+    # class body never spans files), so a raw call's own source_file always
+    # carries its caller's enclosing class's field table too.
+    field_types_by_file: dict[str, dict[str, dict[str, str]]] = {}
+    for result in per_file:
+        ft = result.get("python_field_types")
+        if ft and ft.get("path"):
+            field_types_by_file[ft["path"]] = ft.get("table", {})
+
+    # Base-class map so an inherited method/field resolves up the hierarchy
+    # (mirrors _resolve_cpp_calls's bases_of / lookup_method / field_type).
+    bases_of: dict[str, list[str]] = {}
+    for e in all_edges:
+        if e.get("relation") == "inherits":
+            bases_of.setdefault(e.get("source"), []).append(e.get("target"))
+
+    def lookup_method(cls_nid: str, mk: str, seen: set | None = None) -> str | None:
+        if seen is None:
+            seen = set()
+        if cls_nid in seen:
+            return None
+        seen.add(cls_nid)
+        hit = method_index.get((cls_nid, mk))
+        if hit:
+            return hit
+        for base in bases_of.get(cls_nid, []):
+            r = lookup_method(base, mk, seen)
+            if r:
+                return r
+        return None
+
+    def field_type_of(cls_nid: str | None, field_name: str, seen: set | None = None) -> str | None:
+        if not cls_nid:
+            return None
+        if seen is None:
+            seen = set()
+        if cls_nid in seen:
+            return None
+        seen.add(cls_nid)
+        cnode = node_by_id.get(cls_nid)
+        if cnode is not None:
+            hit = (
+                field_types_by_file.get(cnode.get("source_file", ""), {})
+                .get(cnode.get("label", ""), {})
+                .get(field_name)
+            )
+            if hit:
+                return hit
+        for base in bases_of.get(cls_nid, []):
+            r = field_type_of(base, field_name, seen)
+            if r:
+                return r
+        return None
+
     all_raw_calls: list[dict] = []
     for result in per_file:
         all_raw_calls.extend(result.get("raw_calls", []))
 
     existing_pairs = {(e.get("source"), e.get("target")) for e in all_edges}
-    for rc in all_raw_calls:
-        if not rc.get("is_member_call"):
-            continue
-        receiver = rc.get("receiver")
-        callee = rc.get("callee")
-        caller = rc.get("caller_nid")
-        if not receiver or not callee or not caller:
-            continue
-        # Only a capitalized receiver is treated as a class reference, so an
-        # instance/module (`self`, `obj`, `config`) never collides with a
-        # same-spelled class via the case-folding key.
-        if not receiver[:1].isupper():
-            continue
-        class_nids = class_def_nids.get(_key(receiver), [])
-        if len(class_nids) != 1:  # absent or ambiguous -> bail (god-node guard)
-            continue
-        method_nid = method_index.get((class_nids[0], _key(callee)))
-        if not method_nid or method_nid == caller:
-            continue
-        if (caller, method_nid) in existing_pairs:
-            continue
+
+    def _emit(caller: str, method_nid: str | None, confidence: str, score: float, rc: dict) -> None:
+        if not method_nid or method_nid == caller or (caller, method_nid) in existing_pairs:
+            return
         existing_pairs.add((caller, method_nid))
-        # EXTRACTED: a qualified `ClassName.method()` is an explicit, unambiguous
-        # static reference (unlike a bare instance member call), and the class
-        # resolved to exactly one definition that owns the method.
         all_edges.append({
             "source": caller,
             "target": method_nid,
             "relation": "calls",
             "context": "call",
-            "confidence": "EXTRACTED",
-            "confidence_score": 1.0,
+            "confidence": confidence,
+            "confidence_score": score,
             "source_file": rc.get("source_file", ""),
             "source_location": rc.get("source_location"),
             "weight": 1.0,
         })
+
+    for rc in all_raw_calls:
+        if not rc.get("is_member_call"):
+            continue
+        callee = rc.get("callee")
+        caller = rc.get("caller_nid")
+        if not callee or not caller:
+            continue
+        mk = _key(callee)
+
+        receiver_type = rc.get("receiver_type")
+        if receiver_type:
+            # A local var or typed parameter's type is a 100%-confidence
+            # binding from the extractor's per-function type table.
+            cls_nid = resolve_class(receiver_type)
+            if cls_nid:
+                _emit(caller, lookup_method(cls_nid, mk), "INFERRED", 0.8, rc)
+            continue
+
+        self_field = rc.get("self_field")
+        if self_field:
+            # `self.<field>.method()`: look up the field's type on the caller's
+            # own enclosing class, walking up base classes (constructor
+            # assignment or annotation, possibly inherited from a parent).
+            owner_nid = owner_class_of.get(caller)
+            field_type = field_type_of(owner_nid, self_field)
+            cls_nid = resolve_class(field_type)
+            if cls_nid:
+                _emit(caller, lookup_method(cls_nid, mk), "INFERRED", 0.8, rc)
+            continue
+
+        # Original #1446 path: only a capitalized receiver is treated as a
+        # class reference, so an instance/module (`self`, `obj`, `config`)
+        # never collides with a same-spelled class via the case-folding key.
+        receiver = rc.get("receiver")
+        if not receiver or not receiver[:1].isupper():
+            continue
+        cls_nid = resolve_class(receiver)
+        if not cls_nid:
+            continue
+        # EXTRACTED: a qualified `ClassName.method()` is an explicit, unambiguous
+        # static reference (unlike a bare instance member call), and the class
+        # resolved to exactly one definition that owns the method.
+        _emit(caller, lookup_method(cls_nid, mk), "EXTRACTED", 1.0, rc)
+
+
+def _resolve_js_member_calls(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Resolve cross-file JS/TS member calls to the receiver's real class
+    method. Structural mirror of ``_resolve_python_member_calls`` for JS/TS's
+    ``this.<field>`` / typed-param / typed-local-var / capitalized-static
+    shapes:
+
+    * ``ClassName.method()`` (qualified static, capitalized receiver) ->
+      EXTRACTED.
+    * a local variable or typed parameter (``const repo = new Repo()`` /
+      ``function f(repo: Repo)``) whose type the extractor stamped as
+      ``receiver_type`` on the raw call -> INFERRED.
+    * ``this.<field>.method()`` whose field type the extractor recorded on the
+      caller's own class (constructor assignment, TS field annotation, or TS
+      constructor parameter property), carried as ``self_field`` on the raw
+      call -> INFERRED.
+
+    Every path shares the same single-definition god-node guard: an ambiguous
+    class name bails, and the resolved method must belong to that exact class.
+
+    Must run after id-disambiguation so node ids and caller_nids are final.
+    """
+    def _key(label: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9]+", "", str(label)).lower()
+
+    node_by_id: dict[str, dict] = {n.get("id"): n for n in all_nodes}
+
+    class_def_nids: dict[str, list[str]] = {}
+    method_index: dict[tuple[str, str], str] = {}
+    owner_class_of: dict[str, str] = {}
+    for e in all_edges:
+        if e.get("relation") != "method":
+            continue
+        src, tgt = e.get("source"), e.get("target")
+        cnode = node_by_id.get(src)
+        if cnode is not None:
+            class_def_nids.setdefault(_key(cnode.get("label", "")), []).append(src)
+        tnode = node_by_id.get(tgt)
+        if tnode is not None:
+            method_index[(src, _key(tnode.get("label", "")))] = tgt
+        owner_class_of.setdefault(tgt, src)
+    # A method-less class (`class Repo extends Base {}`) owns no `method` edge
+    # and so is absent above; also index both ends of `inherits` so it still
+    # resolves as a receiver type for base-class method/field lookup.
+    for e in all_edges:
+        if e.get("relation") != "inherits":
+            continue
+        for nid in (e.get("source"), e.get("target")):
+            cnode = node_by_id.get(nid)
+            if cnode is not None:
+                class_def_nids.setdefault(_key(cnode.get("label", "")), []).append(nid)
+    if not class_def_nids:
+        return
+    for k in list(class_def_nids):
+        class_def_nids[k] = sorted(set(class_def_nids[k]))
+
+    def resolve_class(name: str | None) -> str | None:
+        if not name:
+            return None
+        defs = class_def_nids.get(_key(name), [])
+        return defs[0] if len(defs) == 1 else None
+
+    # class_label -> {field_name: TypeName}, keyed per source file. A JS/TS
+    # class and its own methods are always emitted from the same file walk (a
+    # class body never spans files), so a raw call's own source_file always
+    # carries its caller's enclosing class's field table too.
+    field_types_by_file: dict[str, dict[str, dict[str, str]]] = {}
+    for result in per_file:
+        ft = result.get("js_field_types")
+        if ft and ft.get("path"):
+            field_types_by_file[ft["path"]] = ft.get("table", {})
+
+    # Base-class map so an inherited method/field resolves up the hierarchy
+    # (mirrors _resolve_cpp_calls's bases_of / lookup_method / field_type).
+    bases_of: dict[str, list[str]] = {}
+    for e in all_edges:
+        if e.get("relation") == "inherits":
+            bases_of.setdefault(e.get("source"), []).append(e.get("target"))
+
+    def lookup_method(cls_nid: str, mk: str, seen: set | None = None) -> str | None:
+        if seen is None:
+            seen = set()
+        if cls_nid in seen:
+            return None
+        seen.add(cls_nid)
+        hit = method_index.get((cls_nid, mk))
+        if hit:
+            return hit
+        for base in bases_of.get(cls_nid, []):
+            r = lookup_method(base, mk, seen)
+            if r:
+                return r
+        return None
+
+    def field_type_of(cls_nid: str | None, field_name: str, seen: set | None = None) -> str | None:
+        if not cls_nid:
+            return None
+        if seen is None:
+            seen = set()
+        if cls_nid in seen:
+            return None
+        seen.add(cls_nid)
+        cnode = node_by_id.get(cls_nid)
+        if cnode is not None:
+            hit = (
+                field_types_by_file.get(cnode.get("source_file", ""), {})
+                .get(cnode.get("label", ""), {})
+                .get(field_name)
+            )
+            if hit:
+                return hit
+        for base in bases_of.get(cls_nid, []):
+            r = field_type_of(base, field_name, seen)
+            if r:
+                return r
+        return None
+
+    all_raw_calls: list[dict] = []
+    for result in per_file:
+        all_raw_calls.extend(result.get("raw_calls", []))
+
+    existing_pairs = {(e.get("source"), e.get("target")) for e in all_edges}
+
+    def _emit(caller: str, method_nid: str | None, confidence: str, score: float, rc: dict) -> None:
+        if not method_nid or method_nid == caller or (caller, method_nid) in existing_pairs:
+            return
+        existing_pairs.add((caller, method_nid))
+        all_edges.append({
+            "source": caller,
+            "target": method_nid,
+            "relation": "calls",
+            "context": "call",
+            "confidence": confidence,
+            "confidence_score": score,
+            "source_file": rc.get("source_file", ""),
+            "source_location": rc.get("source_location"),
+            "weight": 1.0,
+        })
+
+    for rc in all_raw_calls:
+        if not rc.get("is_member_call"):
+            continue
+        callee = rc.get("callee")
+        caller = rc.get("caller_nid")
+        if not callee or not caller:
+            continue
+        mk = _key(callee)
+
+        receiver_type = rc.get("receiver_type")
+        if receiver_type:
+            # A local var or typed parameter's type is a 100%-confidence
+            # binding from the extractor's per-function type table.
+            cls_nid = resolve_class(receiver_type)
+            if cls_nid:
+                _emit(caller, lookup_method(cls_nid, mk), "INFERRED", 0.8, rc)
+            continue
+
+        self_field = rc.get("self_field")
+        if self_field:
+            # `this.<field>.method()`: look up the field's type on the
+            # caller's own enclosing class, walking up base classes
+            # (constructor assignment, field annotation, or constructor
+            # parameter property, possibly inherited from a parent).
+            owner_nid = owner_class_of.get(caller)
+            field_type = field_type_of(owner_nid, self_field)
+            cls_nid = resolve_class(field_type)
+            if cls_nid:
+                _emit(caller, lookup_method(cls_nid, mk), "INFERRED", 0.8, rc)
+            continue
+
+        # Qualified static: only a capitalized receiver is treated as a class
+        # reference, so an instance (`this`, `obj`, `config`) never collides
+        # with a same-spelled class via the case-folding key.
+        receiver = rc.get("receiver")
+        if not receiver or not receiver[:1].isupper():
+            continue
+        cls_nid = resolve_class(receiver)
+        if not cls_nid:
+            continue
+        # EXTRACTED: a qualified `Helper.method()` is an explicit, unambiguous
+        # static reference (unlike a bare instance member call), and the class
+        # resolved to exactly one definition that owns the method.
+        _emit(caller, lookup_method(cls_nid, mk), "EXTRACTED", 1.0, rc)
 
 
 def _resolve_cpp_calls(
@@ -10324,6 +11182,16 @@ register_language_resolver(
 )
 register_language_resolver(
     LanguageResolver("python_member_calls", frozenset({".py"}), _resolve_python_member_calls)
+)
+# JS/TS type-aware member-call resolution (new Thing() / this.<field> / typed
+# param / typed local var / qualified Helper.method()). Suffix set matches
+# _DISPATCH's JS/TS routing (extract_js) exactly.
+register_language_resolver(
+    LanguageResolver(
+        "js_member_calls",
+        frozenset({".js", ".jsx", ".mjs", ".ts", ".tsx"}),
+        _resolve_js_member_calls,
+    )
 )
 # Ruby type-aware member-call resolution (Class.new + typed var.method). Lives in
 # graphify.ruby_resolution; registered here as a second consumer of the framework.
@@ -14121,6 +14989,7 @@ def extract(
     paths: list[Path],
     cache_root: Path | None = None,
     *,
+    source_root: Path | None = None,
     parallel: bool = True,
     max_workers: int | None = None,
 ) -> dict:
@@ -14136,6 +15005,17 @@ def extract(
         cache_root: explicit root for graphify-out/cache/ (overrides the
             inferred common path prefix). Pass Path('.') when running on a
             subdirectory so the cache stays at ./graphify-out/cache/.
+        source_root: explicit scanned-project root used to relativize node IDs
+            back to their canonical repo-relative form (the #502 id-remap
+            post-pass). MUST be the source tree, never the cache/--out dir.
+            Defaults to the inferred common path prefix of ``paths``. Keep this
+            SEPARATE from cache_root: when graphify runs with ``--out`` the cache
+            lands in an agent-private dir unrelated to the source tree, and
+            reusing that dir as the relativization anchor made
+            ``path.relative_to(root)`` fail for every file, leaving the
+            absolute-path-derived id (e.g. ``n_git_aethergraph_...``) in the
+            persisted symbol_key and leaking the local filesystem path into the
+            shared graph (#1600).
         parallel: if True and there are >= _PARALLEL_THRESHOLD uncached files,
             use ProcessPoolExecutor for multi-core extraction.
         max_workers: max subprocess count. Defaults to cpu_count (or the
@@ -14165,8 +15045,18 @@ def extract(
             root = Path(*paths[0].parts[:common_len]) if common_len else Path(".")
     except Exception:
         root = Path(".")
+    # `root` (from here down) is the SOURCE root used to relativize node IDs
+    # back to their canonical repo-relative form (the #502/#1600 id-remap
+    # post-pass below). cache_root has historically doubled as this anchor, so
+    # keep it as the fallback for back-compat -- but an explicit source_root
+    # WINS. With --out the cache dir is an agent-private dir unrelated to the
+    # source tree; anchoring the remap there made path.relative_to(root) fail
+    # for every file and left the absolute-path-derived id (n_git_aethergraph_)
+    # in the persisted symbol_key, leaking the local path into the shared graph.
     if cache_root is not None:
         root = cache_root
+    if source_root is not None:
+        root = source_root
     root = root.resolve()
 
     effective_root = cache_root or root

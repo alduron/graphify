@@ -4537,7 +4537,10 @@ def main() -> None:
             # Anchor the cache at the output root, not the scanned project:
             # with --out, a <target>/graphify-out/cache/ would leak a
             # graphify-out/ dir into a project that asked for external output.
-            ast_kwargs: dict = {"cache_root": out_root}
+            # But relativize node IDs against the SCANNED project root (target),
+            # never the out dir -- otherwise the id-remap post-pass no-ops and
+            # the absolute source path leaks into every symbol_key (#1600).
+            ast_kwargs: dict = {"cache_root": out_root, "source_root": target}
             if cli_max_workers is not None:
                 ast_kwargs["max_workers"] = cli_max_workers
             print(f"[graphify extract] AST extraction on {len(code_files)} code files...")

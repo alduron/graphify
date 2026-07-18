@@ -100,6 +100,43 @@ def test_extract_disambiguates_duplicate_symbol_ids_by_source_path(tmp_path):
             assert edge["target"] in node_ids, f"Dangling structural target: {edge}"
 
 
+def test_out_dir_cache_root_does_not_leak_absolute_ids(tmp_path):
+    """#1600: when graphify runs with ``--out`` the cache lands in an
+    agent-private dir UNRELATED to the source tree. That dir is passed as
+    ``cache_root``; it must NOT be reused as the ID-relativization anchor.
+
+    Before the fix, ``root`` was clobbered to ``cache_root``, so every source
+    file failed ``path.relative_to(root)``, the #502 id-remap post-pass no-oped,
+    and the absolute source path (drive letter and all, e.g.
+    ``n_git_aethergraph_...``) survived in the persisted symbol_key -- leaking
+    the local filesystem path into the shared graph.
+    """
+    src = tmp_path / "repo"
+    (src / "pkg").mkdir(parents=True)
+    (src / "pkg" / "thing.py").write_text(
+        "class Thing:\n    def run(self):\n        return 1\n", encoding="utf-8"
+    )
+    out_dir = tmp_path / "agent_out"  # unrelated cache/--out dir
+    out_dir.mkdir()
+
+    result = extract(
+        [src / "pkg" / "thing.py"], cache_root=out_dir, source_root=src
+    )
+
+    # IDs are relativized against the SOURCE root, not the out dir.
+    thing = next(n for n in result["nodes"] if n["label"] == "Thing")
+    assert thing["id"] == "pkg_thing_thing", thing["id"]
+
+    # No node/edge id may carry a slugified component of the absolute path
+    # (the tmp_path prefix or the out-dir name).
+    leak_markers = {_make_id(part) for part in (*src.resolve().parts, "agent_out") if _make_id(part)}
+    for node in result["nodes"]:
+        for marker in leak_markers:
+            assert marker not in node["id"].split("_"), (
+                f"absolute path component {marker!r} leaked into id {node['id']!r}"
+            )
+
+
 def test_cross_file_type_annotation_refs_resolve_to_single_node(tmp_path):
     """#1402: a class defined once but referenced via type annotations in N other
     files must NOT create 1+N phantom duplicate nodes (with the referencing file's
@@ -902,6 +939,374 @@ def test_python_qualified_call_ambiguous_class_bails(tmp_path):
         and "do" in nodes[e["target"]]["label"]
     ]
     assert resolved == [], f"ambiguous class name must not resolve: {resolved}"
+
+
+# ── Python instance-field member-call resolution ─────────────────────────────
+
+def test_python_local_var_member_call_resolves_inferred(tmp_path):
+    """`repo = Repo(); repo.save()` within one function body resolves cross-file
+    to Repo.save with an INFERRED `calls` edge (local-var instance resolution)."""
+    repo_mod = tmp_path / "repo_mod.py"
+    builder = tmp_path / "builder.py"
+    repo_mod.write_text(
+        "class Repo:\n"
+        "    def save(self):\n"
+        "        return 1\n"
+    )
+    builder.write_text(
+        "from repo_mod import Repo\n\n"
+        "class Builder:\n"
+        "    def build(self):\n"
+        "        repo = Repo()\n"
+        "        repo.save()\n"
+    )
+    result = extract([builder, repo_mod], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    edges = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "build" in nodes[e["source"]]["label"]
+        and "save" in nodes[e["target"]]["label"]
+        and "repo_mod.py" in (nodes[e["target"]].get("source_file") or "")
+    ]
+    assert len(edges) == 1, f"expected build->save edge, got {edges}"
+    assert edges[0]["confidence"] == "INFERRED"
+
+
+def test_python_ctor_param_field_member_call_resolves_inferred(tmp_path):
+    """`def __init__(self, repo: Repo): self.repo = repo` then `self.repo.save()`
+    in another method resolves cross-file to Repo.save (INFERRED)."""
+    repo_mod = tmp_path / "repo_mod.py"
+    service = tmp_path / "service.py"
+    repo_mod.write_text(
+        "class Repo:\n"
+        "    def save(self):\n"
+        "        return 1\n"
+    )
+    service.write_text(
+        "from repo_mod import Repo\n\n"
+        "class Service:\n"
+        "    def __init__(self, repo: Repo):\n"
+        "        self.repo = repo\n"
+        "    def run(self):\n"
+        "        self.repo.save()\n"
+    )
+    result = extract([service, repo_mod], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    edges = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "run" in nodes[e["source"]]["label"]
+        and "save" in nodes[e["target"]]["label"]
+        and "repo_mod.py" in (nodes[e["target"]].get("source_file") or "")
+    ]
+    assert len(edges) == 1, f"expected run->save edge, got {edges}"
+    assert edges[0]["confidence"] == "INFERRED"
+
+
+def test_python_ctor_new_field_member_call_resolves_inferred(tmp_path):
+    """`def __init__(self): self.repo = Repo()` then `self.repo.save()` in
+    another method resolves cross-file to Repo.save (INFERRED)."""
+    repo_mod = tmp_path / "repo_mod.py"
+    service = tmp_path / "service.py"
+    repo_mod.write_text(
+        "class Repo:\n"
+        "    def save(self):\n"
+        "        return 1\n"
+    )
+    service.write_text(
+        "from repo_mod import Repo\n\n"
+        "class Service:\n"
+        "    def __init__(self):\n"
+        "        self.repo = Repo()\n"
+        "    def run(self):\n"
+        "        self.repo.save()\n"
+    )
+    result = extract([service, repo_mod], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    edges = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "run" in nodes[e["source"]]["label"]
+        and "save" in nodes[e["target"]]["label"]
+        and "repo_mod.py" in (nodes[e["target"]].get("source_file") or "")
+    ]
+    assert len(edges) == 1, f"expected run->save edge, got {edges}"
+    assert edges[0]["confidence"] == "INFERRED"
+
+
+def test_python_class_body_annotation_field_member_call_resolves_inferred(tmp_path):
+    """A bare class-body field annotation (`repo: Repo`) types `self.repo` for
+    a later `self.repo.save()` cross-file call (INFERRED)."""
+    repo_mod = tmp_path / "repo_mod.py"
+    service = tmp_path / "service.py"
+    repo_mod.write_text(
+        "class Repo:\n"
+        "    def save(self):\n"
+        "        return 1\n"
+    )
+    service.write_text(
+        "from repo_mod import Repo\n\n"
+        "class Service:\n"
+        "    repo: Repo\n"
+        "    def run(self):\n"
+        "        self.repo.save()\n"
+    )
+    result = extract([service, repo_mod], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    edges = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "run" in nodes[e["source"]]["label"]
+        and "save" in nodes[e["target"]]["label"]
+        and "repo_mod.py" in (nodes[e["target"]].get("source_file") or "")
+    ]
+    assert len(edges) == 1, f"expected run->save edge, got {edges}"
+    assert edges[0]["confidence"] == "INFERRED"
+
+
+def test_python_typed_param_member_call_resolves_inferred(tmp_path):
+    """A typed parameter (`def f(self, repo: Repo)`) types `repo` for a
+    `repo.save()` call in the same function body, cross-file (INFERRED)."""
+    repo_mod = tmp_path / "repo_mod.py"
+    service = tmp_path / "service.py"
+    repo_mod.write_text(
+        "class Repo:\n"
+        "    def save(self):\n"
+        "        return 1\n"
+    )
+    service.write_text(
+        "from repo_mod import Repo\n\n"
+        "class Service:\n"
+        "    def run(self, repo: Repo):\n"
+        "        repo.save()\n"
+    )
+    result = extract([service, repo_mod], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    edges = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "run" in nodes[e["source"]]["label"]
+        and "save" in nodes[e["target"]]["label"]
+        and "repo_mod.py" in (nodes[e["target"]].get("source_file") or "")
+    ]
+    assert len(edges) == 1, f"expected run->save edge, got {edges}"
+    assert edges[0]["confidence"] == "INFERRED"
+
+
+def test_python_local_var_ambiguous_class_bails(tmp_path):
+    """`repo = Repo(); repo.save()` must not resolve when Repo is defined in
+    2+ files -- the single-definition god-node guard applies to local-var
+    instance resolution too."""
+    a = tmp_path / "a.py"
+    b = tmp_path / "b.py"
+    builder = tmp_path / "builder.py"
+    a.write_text("class Repo:\n    def save(self):\n        return 1\n")
+    b.write_text("class Repo:\n    def save(self):\n        return 2\n")
+    builder.write_text(
+        "class Builder:\n"
+        "    def build(self):\n"
+        "        repo = Repo()\n"
+        "        repo.save()\n"
+    )
+    result = extract([builder, a, b], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    resolved = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "build" in nodes[e["source"]]["label"]
+        and "save" in nodes[e["target"]]["label"]
+    ]
+    assert resolved == [], f"ambiguous class name must not resolve: {resolved}"
+
+
+def test_python_self_field_ambiguous_class_bails(tmp_path):
+    """`self.repo.save()` must not resolve when the field's type name is
+    defined in 2+ files -- the same single-definition god-node guard applies
+    to self-field resolution."""
+    a = tmp_path / "a.py"
+    b = tmp_path / "b.py"
+    service = tmp_path / "service.py"
+    a.write_text("class Repo:\n    def save(self):\n        return 1\n")
+    b.write_text("class Repo:\n    def save(self):\n        return 2\n")
+    service.write_text(
+        "class Service:\n"
+        "    def __init__(self):\n"
+        "        self.repo = Repo()\n"
+        "    def run(self):\n"
+        "        self.repo.save()\n"
+    )
+    result = extract([service, a, b], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    resolved = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "run" in nodes[e["source"]]["label"]
+        and "save" in nodes[e["target"]]["label"]
+    ]
+    assert resolved == [], f"ambiguous field type must not resolve: {resolved}"
+
+
+def test_python_reassigned_local_var_member_call_bails(tmp_path):
+    """A local var reassigned to a different type must not resolve -- the
+    100%-confidence contract poisons an ambiguous binding to None."""
+    repo_mod = tmp_path / "repo_mod.py"
+    builder = tmp_path / "builder.py"
+    repo_mod.write_text(
+        "class Repo:\n"
+        "    def save(self):\n"
+        "        return 1\n"
+        "class Other:\n"
+        "    def save(self):\n"
+        "        return 2\n"
+    )
+    builder.write_text(
+        "from repo_mod import Repo, Other\n\n"
+        "class Builder:\n"
+        "    def build(self):\n"
+        "        repo = Repo()\n"
+        "        repo = Other()\n"
+        "        repo.save()\n"
+    )
+    result = extract([builder, repo_mod], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    resolved = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "build" in nodes[e["source"]]["label"]
+        and "save" in nodes[e["target"]]["label"]
+    ]
+    assert resolved == [], f"reassigned local var must not resolve: {resolved}"
+
+
+# ── Python base-class (inherits) member-call resolution ──────────────────────
+
+def test_python_inherited_method_member_call_resolves_inferred(tmp_path):
+    """`class Repo(Base): pass` inherits `save` from Base; a local-var call
+    `repo.save()` resolves cross-file to Base.save (INFERRED)."""
+    repo_mod = tmp_path / "repo_mod.py"
+    service = tmp_path / "service.py"
+    repo_mod.write_text(
+        "class Base:\n"
+        "    def save(self):\n"
+        "        return 1\n\n"
+        "class Repo(Base):\n"
+        "    pass\n"
+    )
+    service.write_text(
+        "from repo_mod import Repo\n\n"
+        "class Service:\n"
+        "    def run(self):\n"
+        "        repo = Repo()\n"
+        "        repo.save()\n"
+    )
+    result = extract([service, repo_mod], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    edges = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "run" in nodes[e["source"]]["label"]
+        and "save" in nodes[e["target"]]["label"]
+        and "repo_mod.py" in (nodes[e["target"]].get("source_file") or "")
+    ]
+    assert len(edges) == 1, f"expected run->save edge (inherited method), got {edges}"
+    assert edges[0]["confidence"] == "INFERRED"
+
+
+def test_python_inherited_field_member_call_resolves_inferred(tmp_path):
+    """A field assigned in Base.__init__ (`self.svc = Svc()`) is inherited by
+    `class C(Base)`; `self.svc.run()` in C resolves cross-file to Svc.run."""
+    svc_mod = tmp_path / "svc_mod.py"
+    base_mod = tmp_path / "base_mod.py"
+    sub_mod = tmp_path / "sub_mod.py"
+    svc_mod.write_text(
+        "class Svc:\n"
+        "    def run(self):\n"
+        "        return 1\n"
+    )
+    base_mod.write_text(
+        "from svc_mod import Svc\n\n"
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        self.svc = Svc()\n"
+    )
+    sub_mod.write_text(
+        "from base_mod import Base\n\n"
+        "class C(Base):\n"
+        "    def go(self):\n"
+        "        self.svc.run()\n"
+    )
+    result = extract([sub_mod, base_mod, svc_mod], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    edges = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "go" in nodes[e["source"]]["label"]
+        and "run" in nodes[e["target"]]["label"]
+        and "svc_mod.py" in (nodes[e["target"]].get("source_file") or "")
+    ]
+    assert len(edges) == 1, f"expected go->run edge (inherited field), got {edges}"
+    assert edges[0]["confidence"] == "INFERRED"
+
+
+def test_python_cross_file_inherited_method_resolves_inferred(tmp_path):
+    """Base lives in a different file than the subclass; the inherited
+    method still resolves cross-file (INFERRED)."""
+    base_mod = tmp_path / "base_mod.py"
+    repo_mod = tmp_path / "repo_mod.py"
+    service = tmp_path / "service.py"
+    base_mod.write_text(
+        "class Base:\n"
+        "    def save(self):\n"
+        "        return 1\n"
+    )
+    repo_mod.write_text(
+        "from base_mod import Base\n\n"
+        "class Repo(Base):\n"
+        "    pass\n"
+    )
+    service.write_text(
+        "from repo_mod import Repo\n\n"
+        "class Service:\n"
+        "    def run(self):\n"
+        "        repo = Repo()\n"
+        "        repo.save()\n"
+    )
+    result = extract([service, repo_mod, base_mod], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    edges = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "run" in nodes[e["source"]]["label"]
+        and "save" in nodes[e["target"]]["label"]
+        and "base_mod.py" in (nodes[e["target"]].get("source_file") or "")
+    ]
+    assert len(edges) == 1, f"expected run->save edge (cross-file base), got {edges}"
+    assert edges[0]["confidence"] == "INFERRED"
+
+
+def test_python_inheritance_cycle_guard_no_hang(tmp_path):
+    """Malformed cyclic inheritance (`A(B)` / `B(A)`) must not hang base-class
+    resolution and must not emit a bogus edge for an undefined method."""
+    mod = tmp_path / "cyclic.py"
+    mod.write_text(
+        "class A(B):\n"
+        "    def a_method(self):\n"
+        "        obj = A()\n"
+        "        obj.missing()\n\n"
+        "class B(A):\n"
+        "    def b_method(self):\n"
+        "        return 1\n"
+    )
+    result = extract([mod], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    bad = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "a_method" in nodes[e["source"]]["label"]
+        and "missing" in nodes.get(e["target"], {}).get("label", "")
+    ]
+    assert bad == [], f"undefined method must not resolve even with a cycle: {bad}"
 
 
 # ── TSX (JSX-aware) parsing ──────────────────────────────────────────────────
