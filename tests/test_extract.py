@@ -137,6 +137,41 @@ def test_out_dir_cache_root_does_not_leak_absolute_ids(tmp_path):
             )
 
 
+def test_no_leaked_root_prefix_on_nodes_or_edges(tmp_path):
+    """#1600: the final safety-net sweep strips a source-root prefix from BOTH node ids and edge
+    endpoints. The id-remap keys on exact strings built from ``paths``, so it misses dangling
+    reference targets and edges produced AFTER it (cross-file import resolution) -- those kept the
+    absolute-path form ``n_git_<abspath>_...`` and leaked the local path into every edge norm.
+    """
+    src = tmp_path / "repo"
+    (src / "pkg").mkdir(parents=True)
+    (src / "pkg" / "thing.py").write_text(
+        "class Thing:\n    def run(self):\n        return 1\n", encoding="utf-8"
+    )
+    # A second file that imports + uses the first -> cross-file edges produced after the id-remap.
+    (src / "pkg" / "user.py").write_text(
+        "from pkg.thing import Thing\n\n\ndef use(obj: Thing) -> Thing:\n    return obj\n",
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "agent_out"
+    out_dir.mkdir()
+
+    result = extract(
+        [src / "pkg" / "thing.py", src / "pkg" / "user.py"],
+        cache_root=out_dir,
+        source_root=src,
+    )
+
+    leak = _make_id(str(src.resolve())) + "_"  # e.g. "n_git_...repo_"
+    for node in result["nodes"]:
+        nid = node.get("id", "")
+        assert not (isinstance(nid, str) and nid.startswith(leak)), f"leaked node id {nid!r}"
+    for edge in result["edges"]:
+        for end in ("source", "target"):
+            ev = edge.get(end, "")
+            assert not (isinstance(ev, str) and ev.startswith(leak)), f"leaked edge {end} {ev!r}"
+
+
 def test_cross_file_type_annotation_refs_resolve_to_single_node(tmp_path):
     """#1402: a class defined once but referenced via type annotations in N other
     files must NOT create 1+N phantom duplicate nodes (with the referencing file's

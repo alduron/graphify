@@ -15410,6 +15410,38 @@ def extract(
     for n in all_nodes:
         n["_origin"] = "ast"
 
+    # Final safety net (#1600): strip any surviving source-root prefix from node ids AND edge
+    # endpoints. The id-remap above keys on exact strings built from `paths`, so it misses dangling
+    # reference targets and edges produced AFTER it (cross-file import resolution, colliding-id
+    # disambiguation), which can still carry the absolute-path-derived form n_git_<abspath>_... and
+    # leak the local filesystem path into graph.json (and every downstream symbol_key / edge norm).
+    # Stripping yields the same canonical repo-relative form the node remap produces, so a leaked edge
+    # endpoint re-points at its real (already-relativized) node instead of dangling.
+    root_prefixes: set[str] = set()
+    try:
+        for _form in {str(root), root.as_posix()}:
+            _slug = _make_id(_form)
+            if _slug:
+                root_prefixes.add(_slug + "_")
+    except Exception:
+        root_prefixes = set()
+    if root_prefixes:
+        def _strip_root_prefix(value: str) -> str:
+            for _pref in root_prefixes:
+                if value.startswith(_pref) and len(value) > len(_pref):
+                    return value[len(_pref):]
+            return value
+
+        for n in all_nodes:
+            nid = n.get("id")
+            if isinstance(nid, str):
+                n["id"] = _strip_root_prefix(nid)
+        for e in all_edges:
+            for _end in ("source", "target"):
+                ev = e.get(_end)
+                if isinstance(ev, str):
+                    e[_end] = _strip_root_prefix(ev)
+
     return {
         "nodes": all_nodes,
         "edges": all_edges,
