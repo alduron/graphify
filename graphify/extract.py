@@ -15454,7 +15454,12 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
     if target.is_file():
         return [target]
     _EXTENSIONS = set(_DISPATCH.keys())
-    from graphify.detect import _is_ignored, _is_noise_dir, _load_graphifyignore
+    from graphify.detect import (
+        _is_ignored,
+        _is_nested_repo_root,
+        _is_noise_dir,
+        _load_graphifyignore,
+    )
     ignore_root = root if root is not None else target
     patterns = _load_graphifyignore(ignore_root)
     # Shared across all _is_ignored calls in this scan so ancestor-directory
@@ -15479,6 +15484,7 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
             dirnames[:] = [
                 d for d in dirnames
                 if not _is_noise_dir(d)
+                and not _is_nested_repo_root(dp / d)
                 and (has_negation or not _ignored(dp / d))
             ]
             for fname in filenames:
@@ -15496,7 +15502,9 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
                 dirnames.clear()
                 continue
         dp = Path(dirpath)
-        dirnames[:] = [d for d in dirnames if not _is_noise_dir(d)]
+        dirnames[:] = [
+            d for d in dirnames if not _is_noise_dir(d) and not _is_nested_repo_root(dp / d)
+        ]
         for fname in filenames:
             p = dp / fname
             if p.suffix in _EXTENSIONS and not _ignored(p):

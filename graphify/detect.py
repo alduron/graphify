@@ -719,6 +719,15 @@ def _is_noise_dir(part: str, parent: "Path | None" = None) -> bool:
 _VCS_MARKERS = (".git", ".hg", ".svn", "_darcs", ".fossil")
 
 
+def _is_nested_repo_root(path: "Path") -> bool:
+    """True if `path` is its OWN VCS checkout: a git worktree (a `.git` FILE), a submodule / nested
+    clone (a `.git` DIR), or another VCS. Extraction must NOT descend into it - it has its own source
+    boundary and is synced as its own project, so walking it duplicates that repo's source into this
+    graph. Only ever called on a SUBDIRECTORY of the scan root, so the root's own `.git` is never
+    self-pruned. (Convention_ExtractionMustRespectRepoSourceBoundary.)"""
+    return any((path / marker).exists() for marker in _VCS_MARKERS)
+
+
 def _parse_gitignore_line(raw: str) -> str:
     """Parse one raw line from a .graphifyignore file per gitignore spec.
 
@@ -1086,6 +1095,7 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
                 dirnames[:] = [
                     d for d in dirnames
                     if not _is_noise_dir(d, dp)
+                    and not _is_nested_repo_root(dp / d)
                     and not _is_ignored(dp / d, root, ignore_patterns, _cache=ignore_cache)
                 ]
             for fname in filenames:
