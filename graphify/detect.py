@@ -718,14 +718,49 @@ def _is_noise_dir(part: str, parent: "Path | None" = None) -> bool:
 
 _VCS_MARKERS = (".git", ".hg", ".svn", "_darcs", ".fossil")
 
+# Non-git VCS markers only: used by _is_nested_repo_root's boundary check, which handles ".git"
+# separately (a submodule's ".git" FILE must NOT be treated as a boundary, unlike every other marker
+# here, which always means "this is a separate checkout"). _VCS_MARKERS itself keeps ".git" because
+# _find_vcs_root below reuses it for unrelated .graphifyignore-root discovery, where any VCS marker
+# (including a plain repo's ".git" directory) legitimately marks the root.
+_NON_GIT_VCS_MARKERS = tuple(m for m in _VCS_MARKERS if m != ".git")
+
+
+def _is_linked_git_worktree(git_marker: "Path") -> bool:
+    """True if a `.git` FILE's `gitdir:` target has a `/worktrees/` path segment.
+
+    A linked worktree's `.git` file points at `<main-repo>/.git/worktrees/<name>` (or, for a worktree
+    of a submodule's own repo, `<main-repo>/.git/modules/<submodule>/worktrees/<name>`) - both carry
+    the literal `/worktrees/` segment. A plain SUBMODULE's `.git` file instead points at
+    `.../modules/<submodule>` with no `worktrees` segment, so this correctly returns False for a
+    submodule (real source this project owns, must be walked) and True only for an actual linked
+    worktree (a full duplicate source copy, must NOT be walked)."""
+    try:
+        first_line = git_marker.read_text(encoding="utf-8", errors="ignore").splitlines()[:1]
+    except OSError:
+        return False
+    if not first_line or not first_line[0].strip().lower().startswith("gitdir:"):
+        return False
+    target = first_line[0].split(":", 1)[1].strip().replace("\\", "/")
+    return "/worktrees/" in target
+
 
 def _is_nested_repo_root(path: "Path") -> bool:
-    """True if `path` is its OWN VCS checkout: a git worktree (a `.git` FILE), a submodule / nested
-    clone (a `.git` DIR), or another VCS. Extraction must NOT descend into it - it has its own source
-    boundary and is synced as its own project, so walking it duplicates that repo's source into this
-    graph. Only ever called on a SUBDIRECTORY of the scan root, so the root's own `.git` is never
-    self-pruned. (Convention_ExtractionMustRespectRepoSourceBoundary.)"""
-    return any((path / marker).exists() for marker in _VCS_MARKERS)
+    """True if `path` is its own VCS checkout that extraction must NOT descend into: a linked git
+    worktree, a nested independent clone (full `.git` DIR, not a submodule pointer), or another VCS
+    checkout. A git SUBMODULE (`.git` FILE pointing at `.../modules/<name>`, no `/worktrees/` segment)
+    is real source this project owns and must be walked, so it is deliberately excluded here - only a
+    linked worktree or a genuinely separate clone has its own source boundary that would duplicate
+    content into this graph. Only ever called on a SUBDIRECTORY of the scan root, so the root's own
+    `.git` is never self-pruned. (Convention_ExtractionMustRespectRepoSourceBoundary.)"""
+    if any((path / marker).exists() for marker in _NON_GIT_VCS_MARKERS):
+        return True
+    git_marker = path / ".git"
+    if git_marker.is_dir():
+        return True
+    if git_marker.is_file():
+        return _is_linked_git_worktree(git_marker)
+    return False
 
 
 def _parse_gitignore_line(raw: str) -> str:
