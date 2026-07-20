@@ -1528,3 +1528,40 @@ def test_convert_office_file_does_not_rewrite_existing_sidecar(tmp_path, monkeyp
     second = detect_mod.convert_office_file(src, out_dir)
     assert second == first
     assert second.stat().st_mtime_ns == mtime_before
+
+
+def test_is_nested_repo_root_submodule_is_walked(tmp_path):
+    # A submodule's .git is a FILE pointing at .../modules/<name> (no /worktrees/ segment) - it is
+    # real source this project owns and must NOT be pruned (regression: it used to be treated the
+    # same as a linked worktree, so a whole submodule's source vanished from extraction).
+    sub = tmp_path / "api"
+    sub.mkdir()
+    (sub / ".git").write_text("gitdir: ../.git/modules/api\n")
+    assert detect_mod._is_nested_repo_root(sub) is False
+
+
+def test_is_nested_repo_root_linked_worktree_is_pruned(tmp_path):
+    wt = tmp_path / "aethergraph-api-wt-codemapjoin"
+    wt.mkdir()
+    (wt / ".git").write_text("gitdir: N:/Git/aethergraph/.git/modules/api/worktrees/aethergraph-api-wt-codemapjoin\n")
+    assert detect_mod._is_nested_repo_root(wt) is True
+
+
+def test_is_nested_repo_root_nested_clone_is_pruned(tmp_path):
+    clone = tmp_path / "vendored-thing"
+    clone.mkdir()
+    (clone / ".git").mkdir()
+    assert detect_mod._is_nested_repo_root(clone) is True
+
+
+def test_is_nested_repo_root_other_vcs_is_pruned(tmp_path):
+    svn_repo = tmp_path / "old-svn-checkout"
+    svn_repo.mkdir()
+    (svn_repo / ".svn").mkdir()
+    assert detect_mod._is_nested_repo_root(svn_repo) is True
+
+
+def test_is_nested_repo_root_plain_dir_is_walked(tmp_path):
+    plain = tmp_path / "src"
+    plain.mkdir()
+    assert detect_mod._is_nested_repo_root(plain) is False
