@@ -721,6 +721,59 @@ def test_rebuild_code_accepts_repo_relative_changed_path_for_subdir_root(tmp_pat
         os.chdir(cwd)
 
 
+# --- PR 3a: out_dir threads an external --out root through incremental rebuild ---
+
+def test_rebuild_code_out_dir_writes_outside_watch_path(tmp_path):
+    """out_dir (the CLI's `update --out DIR`) must resolve graph.json, the AST
+    cache, and the manifest under DIR/graphify-out/ -- mirroring
+    `graphify extract --out DIR` -- and must never touch watch_path/graphify-out/,
+    the agent-private-cache use case this exists for."""
+    from graphify.watch import _rebuild_code
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    keep = proj / "keep.py"
+    modify = proj / "modify.py"
+    drop = proj / "drop.py"
+    keep.write_text("def keep_fn():\n    return 1\n", encoding="utf-8")
+    modify.write_text("def old_fn():\n    return 2\n", encoding="utf-8")
+    drop.write_text("def drop_fn():\n    return 3\n", encoding="utf-8")
+
+    external_out = tmp_path / "agent-cache"
+
+    ok = _rebuild_code(proj, no_cluster=True, acquire_lock=False, out_dir=external_out)
+    assert ok is True
+    assert not (proj / "graphify-out").exists(), "full rebuild must not write inside watch_path"
+
+    graph_path = external_out / "graphify-out" / "graph.json"
+    assert graph_path.exists()
+    before_labels = {n.get("label") for n in json.loads(graph_path.read_text(encoding="utf-8")).get("nodes", [])}
+    assert {"keep_fn()", "old_fn()", "drop_fn()"} <= before_labels
+    assert (external_out / "graphify-out" / "manifest.json").exists()
+    assert list((external_out / "graphify-out" / "cache").rglob("*.json")), \
+        "the AST cache should also resolve under out_dir"
+
+    modify.write_text("def new_fn():\n    return 20\n", encoding="utf-8")
+    drop.unlink()
+
+    ok = _rebuild_code(
+        proj,
+        changed_paths=[modify, drop],
+        no_cluster=True,
+        acquire_lock=False,
+        out_dir=external_out,
+        force=True,
+    )
+    assert ok is True
+    assert not (proj / "graphify-out").exists(), "incremental rebuild must not write inside watch_path"
+
+    after_labels = {n.get("label") for n in json.loads(graph_path.read_text(encoding="utf-8")).get("nodes", [])}
+    assert "new_fn()" in after_labels
+    assert "old_fn()" not in after_labels
+    assert "keep_fn()" in after_labels, "untouched file's nodes must survive"
+    assert "drop_fn()" not in after_labels, "deleted file's nodes must be evicted"
+
+
 # --- #1059: pending-changes queue prevents commit drops under lock contention ---
 
 

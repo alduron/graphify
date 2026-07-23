@@ -3569,22 +3569,39 @@ def main() -> None:
     elif cmd == "update":
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
         no_cluster = False
+        files_arg: str | None = None
+        out_arg: str | None = None
         args = sys.argv[2:]
         watch_arg: str | None = None
-        for a in args:
+        i = 0
+        while i < len(args):
+            a = args[i]
             if a == "--force":
-                force = True
-                continue
-            if a == "--no-cluster":
-                no_cluster = True
-                continue
-            if a.startswith("-"):
-                print(f"error: unknown update option: {a}", file=sys.stderr)
+                force = True; i += 1
+            elif a == "--no-cluster":
+                no_cluster = True; i += 1
+            elif a == "--files" and i + 1 < len(args):
+                files_arg = args[i + 1]; i += 2
+            elif a.startswith("--files="):
+                files_arg = a.split("=", 1)[1]; i += 1
+            elif a == "--out" and i + 1 < len(args):
+                out_arg = args[i + 1]; i += 2
+            elif a.startswith("--out="):
+                out_arg = a.split("=", 1)[1]; i += 1
+            elif a.startswith("-"):
+                print(
+                    "error: unknown update option: " + a + "\n"
+                    "Usage: graphify update [path] [--force] [--no-cluster] "
+                    "[--files <changelist-file>] [--out <dir>]",
+                    file=sys.stderr,
+                )
                 sys.exit(2)
-            if watch_arg is not None:
-                print("error: update accepts at most one path argument", file=sys.stderr)
-                sys.exit(2)
-            watch_arg = a
+            else:
+                if watch_arg is not None:
+                    print("error: update accepts at most one path argument", file=sys.stderr)
+                    sys.exit(2)
+                watch_arg = a
+                i += 1
 
         if watch_arg is not None:
             watch_path = Path(watch_arg)
@@ -3598,13 +3615,48 @@ def main() -> None:
         if not watch_path.exists():
             print(f"error: path not found: {watch_path}", file=sys.stderr)
             sys.exit(1)
+
+        # --files: a UTF-8 newline-delimited list of changed paths (absolute
+        # or repo-relative; blank lines ignored). Restricts the rebuild to
+        # exactly those files instead of the full corpus (#1423-adjacent
+        # incremental update -- graphify.watch._rebuild_code already
+        # implements this via changed_paths, previously only reachable from
+        # the watcher/hooks, never from this CLI command).
+        changed_paths: list[Path] | None = None
+        if files_arg is not None:
+            files_list_path = Path(files_arg)
+            if not files_list_path.exists():
+                print(f"error: --files list not found: {files_list_path}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                raw_lines = files_list_path.read_text(encoding="utf-8").splitlines()
+            except OSError as exc:
+                print(f"error: could not read --files list {files_list_path}: {exc}", file=sys.stderr)
+                sys.exit(1)
+            changed_paths = [Path(line.strip()) for line in raw_lines if line.strip()]
+            if not changed_paths:
+                print(f"error: --files list {files_list_path} contains no paths", file=sys.stderr)
+                sys.exit(1)
+
+        out_dir = Path(out_arg) if out_arg is not None else None
+
         from graphify.watch import _rebuild_code
 
-        print(f"Re-extracting code files in {watch_path} (no LLM needed)...")
+        if changed_paths is not None:
+            print(f"Re-extracting {len(changed_paths)} changed file(s) in {watch_path} (no LLM needed)...")
+        else:
+            print(f"Re-extracting code files in {watch_path} (no LLM needed)...")
         # Interactive CLI: block on the per-repo lock rather than skip, so the
         # user sees their explicit `graphify update` complete instead of
         # exiting silently when a hook-driven rebuild happens to be running.
-        ok = _rebuild_code(watch_path, force=force, no_cluster=no_cluster, block_on_lock=True)
+        ok = _rebuild_code(
+            watch_path,
+            changed_paths=changed_paths,
+            force=force,
+            no_cluster=no_cluster,
+            block_on_lock=True,
+            out_dir=out_dir,
+        )
         if ok:
             print("Code graph updated. For doc/paper/image changes run /graphify --update in your AI assistant.")
             if not (
