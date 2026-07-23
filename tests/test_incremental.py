@@ -103,6 +103,106 @@ def _edges(graph_json: Path) -> list[dict]:
     return g.get("links", g.get("edges", []))
 
 
+def _node_labels(graph_json: Path) -> set[str]:
+    g = json.loads(graph_json.read_text())
+    return {n.get("label") for n in g.get("nodes", [])}
+
+
+def _make_three_file_project(base: Path) -> Path:
+    """A tiny 3-file project used by the `update --files` scenarios below."""
+    proj = base / "proj"
+    proj.mkdir()
+    (proj / "keep.py").write_text("def keep_fn():\n    return 1\n", encoding="utf-8")
+    (proj / "modify.py").write_text("def old_fn():\n    return 2\n", encoding="utf-8")
+    (proj / "drop.py").write_text("def drop_fn():\n    return 3\n", encoding="utf-8")
+    return proj
+
+
+def test_update_files_flag_incremental_rebuild(tmp_path):
+    """`graphify update --files <list>` (PR 3a) must exercise the SAME incremental
+    path _rebuild_code already implements for the watcher/hooks: only the changed
+    file is re-extracted, an untouched file's nodes survive unchanged, and a
+    deleted file's nodes are evicted -- without ever falling back to a full-corpus
+    rebuild (which would also happen to produce the right end state, so the
+    real assertion that matters is that this only re-extracts what --files lists;
+    see the graphify.watch._rebuild_code unit tests in test_watch.py for that)."""
+    proj = _make_three_file_project(tmp_path)
+
+    r1 = _run(["extract", str(proj), "--no-cluster"], tmp_path)
+    assert r1.returncode == 0, r1.stderr
+    gj = proj / "graphify-out" / "graph.json"
+    before_labels = _node_labels(gj)
+    assert {"keep_fn()", "old_fn()", "drop_fn()"} <= before_labels
+
+    # Modify one file, delete another, leave the third untouched.
+    (proj / "modify.py").write_text("def new_fn():\n    return 20\n", encoding="utf-8")
+    (proj / "drop.py").unlink()
+
+    changelist = tmp_path / "changed_files.txt"
+    changelist.write_text(
+        "\n".join([str(proj / "modify.py"), str(proj / "drop.py"), ""]),
+        encoding="utf-8",
+    )
+
+    r2 = _run(["update", str(proj), "--files", str(changelist), "--no-cluster"], tmp_path)
+    assert r2.returncode == 0, r2.stderr
+
+    after_labels = _node_labels(gj)
+    assert "new_fn()" in after_labels, "modified file's new symbol should appear"
+    assert "old_fn()" not in after_labels, "modified file's stale symbol should be gone"
+    assert "keep_fn()" in after_labels, "untouched file's nodes must survive"
+    assert "drop_fn()" not in after_labels, "deleted file's nodes must be evicted"
+
+
+def test_update_files_and_out_flag_write_outside_project_tree(tmp_path):
+    """`graphify update --files ... --out DIR` must resolve graph.json/cache/lock
+    under DIR/graphify-out/ (mirroring `graphify extract --out DIR`), never
+    inside the scanned project -- required for the agent-private-cache use case
+    where the project tree must stay untouched by graphify's own output."""
+    proj = _make_three_file_project(tmp_path)
+    external_out = tmp_path / "agent-cache"
+
+    r1 = _run(
+        ["extract", str(proj), "--no-cluster", "--out", str(external_out)], tmp_path
+    )
+    assert r1.returncode == 0, r1.stderr
+    gj = external_out / "graphify-out" / "graph.json"
+    assert gj.exists()
+    before_labels = _node_labels(gj)
+    assert {"keep_fn()", "old_fn()", "drop_fn()"} <= before_labels
+    assert not (proj / "graphify-out").exists(), "extract --out must not write inside the project"
+
+    (proj / "modify.py").write_text("def new_fn():\n    return 20\n", encoding="utf-8")
+    (proj / "drop.py").unlink()
+
+    changelist = tmp_path / "changed_files.txt"
+    changelist.write_text(
+        "\n".join([str(proj / "modify.py"), str(proj / "drop.py"), ""]),
+        encoding="utf-8",
+    )
+
+    r2 = _run(
+        [
+            "update", str(proj),
+            "--files", str(changelist),
+            "--out", str(external_out),
+            "--no-cluster",
+        ],
+        tmp_path,
+    )
+    assert r2.returncode == 0, r2.stderr
+    assert not (proj / "graphify-out").exists(), "update --out must not write inside the project"
+
+    after_labels = _node_labels(gj)
+    assert "new_fn()" in after_labels
+    assert "old_fn()" not in after_labels
+    assert "keep_fn()" in after_labels
+    assert "drop_fn()" not in after_labels
+
+    cache_dir = external_out / "graphify-out" / "cache"
+    assert cache_dir.exists(), "the AST cache should also resolve under --out"
+
+
 def test_update_prunes_a_removed_imports_edge(tmp_path):
     """#1521: when an import is deleted from a file, `graphify update` must prune
     the edge it produced — preserving it (keyed only on endpoint membership) left a

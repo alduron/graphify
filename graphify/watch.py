@@ -423,6 +423,7 @@ def _rebuild_code(
     no_cluster: bool = False,
     acquire_lock: bool = True,
     block_on_lock: bool = False,
+    out_dir: Path | None = None,
 ) -> bool:
     """Re-run AST extraction + build + optional cluster + report for code files. No LLM needed.
 
@@ -445,9 +446,22 @@ def _rebuild_code(
     ``no_cluster`` skips community detection and writes raw merged extraction
     JSON to graphify-out/graph.json (mirrors ``extract --no-cluster``).
 
+    ``out_dir`` (default None) redirects graph.json, the rebuild lock, the
+    pending-change queue, the AST cache and the manifest to
+    ``out_dir/<GRAPHIFY_OUT>/`` instead of ``watch_path/<GRAPHIFY_OUT>/`` --
+    mirrors ``graphify extract --out DIR`` (DIR is the parent the output
+    dir is created under, not the output dir itself) so a caller that
+    extracts and later incrementally updates into the same external
+    ``--out`` root (e.g. an agent-private cache dir outside the repo) finds
+    graph.json in the same place both times. Source-file paths recorded in
+    the graph are still relativized against ``watch_path`` regardless of
+    ``out_dir`` (#1600 -- the cache/out root must never double as the
+    source-relativization anchor).
+
     Returns True on success, False on error or skipped-due-to-lock.
     """
-    out = watch_path / _GRAPHIFY_OUT
+    out_root = out_dir.resolve() if out_dir is not None else watch_path
+    out = out_root / _GRAPHIFY_OUT
     if acquire_lock:
         # #1059: incremental (changed_paths is not None) hooks must not drop
         # their change set when another rebuild is already running. Queue
@@ -479,6 +493,7 @@ def _rebuild_code(
                 force=force,
                 no_cluster=no_cluster,
                 acquire_lock=False,
+                out_dir=out_dir,
             )
             # Late-arrival drain: another hook may have queued work while we
             # were rebuilding. Loop up to _PENDING_DRAIN_MAX_PASSES times so a
@@ -496,6 +511,7 @@ def _rebuild_code(
                         force=force,
                         no_cluster=no_cluster,
                         acquire_lock=False,
+                        out_dir=out_dir,
                     ) and ok
             return ok
 
@@ -511,6 +527,16 @@ def _rebuild_code(
         from graphify.report import generate
         from graphify.export import to_json, to_html
         from graphify.security import check_graph_file_size_cap
+
+        def _save_ast_manifest(files: dict) -> None:
+            # Manifest keys are always relativized against project_root (the
+            # source tree); only the manifest FILE's own location follows
+            # out_dir, mirroring the graphify_out/manifest_path split the
+            # `extract` CLI command uses for --out (#1600-adjacent: never let
+            # the out root double as the source-relativization anchor).
+            from graphify.detect import save_manifest
+            kwargs = {"manifest_path": str(out / "manifest.json")} if out_dir is not None else {}
+            save_manifest(files, kind="ast", root=project_root, **kwargs)
 
         detected = detect(watch_path, follow_symlinks=follow_symlinks)
         code_files = [Path(f) for f in detected['files']['code']]
@@ -578,7 +604,17 @@ def _rebuild_code(
             extract_targets = code_files
 
         commit = _git_head()
-        result = extract(extract_targets, cache_root=watch_root) if extract_targets else {
+        # Anchor the AST cache at out_root (== watch_root when out_dir is
+        # None, matching prior behaviour exactly), but always relativize
+        # node IDs against watch_root -- with an external out_dir the cache
+        # dir is unrelated to the source tree, and reusing it as the
+        # relativization anchor would leak the local filesystem path into
+        # every symbol_key (#1600, see graphify.extract.extract's
+        # cache_root/source_root doc).
+        ast_cache_root = out_dir.resolve() if out_dir is not None else watch_root
+        result = extract(
+            extract_targets, cache_root=ast_cache_root, source_root=watch_root,
+        ) if extract_targets else {
             "nodes": [], "edges": [], "hyperedges": [],
             "input_tokens": 0, "output_tokens": 0,
         }
@@ -699,7 +735,7 @@ def _rebuild_code(
         else:
             rebuilt_sources = {(_nsf(str(p), _rebuilt_root) or str(p)) for p in extract_targets}
         rebuilt_sources |= set(deleted_paths)
-        out.mkdir(exist_ok=True)
+        out.mkdir(parents=True, exist_ok=True)
         # Write the user-supplied path rather than the resolved absolute form
         # so a committed ``graphify-out/.graphify_root`` is portable across
         # clones and CI runners (#777). When ``watch_path`` is ``.`` (the
@@ -740,8 +776,7 @@ def _rebuild_code(
                 existing_graph.write_text(candidate_graph_text, encoding="utf-8")
 
             try:
-                from graphify.detect import save_manifest
-                save_manifest(detected["files"], kind="ast", root=project_root)
+                _save_ast_manifest(detected["files"])
             except Exception:
                 pass
 
@@ -779,8 +814,7 @@ def _rebuild_code(
                 same_topology = False
             if same_topology:
                 try:
-                    from graphify.detect import save_manifest
-                    save_manifest(detected["files"], kind="ast", root=project_root)
+                    _save_ast_manifest(detected["files"])
                 except Exception:
                     pass
                 flag = out / "needs_update"
@@ -851,8 +885,7 @@ def _rebuild_code(
             labels_file.write_text(labels_json, encoding="utf-8")
 
         try:
-            from graphify.detect import save_manifest
-            save_manifest(detected["files"], kind="ast", root=project_root)
+            _save_ast_manifest(detected["files"])
         except Exception:
             pass
 
