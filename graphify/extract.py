@@ -3375,9 +3375,37 @@ def _extract_generic(
     if config.ts_module == "tree_sitter_swift":
         swift_protocol_names, swift_class_names = _swift_pre_scan(root, source)
 
-    def add_node(nid: str, label: str, line: int) -> None:
+    # id -> the label that claimed it, so a GENUINE collision (two different
+    # symbols) is told apart from the same symbol being visited twice.
+    claimed_label: dict[str, str] = {}
+
+    def add_node(nid: str, label: str, line: int) -> str:
+        """Append the node and return the id ACTUALLY used.
+
+        Callers must use the RETURNED id for edges and label maps, because a
+        colliding id gets remapped here. Names that differ only by underscore
+        padding normalize onto ONE id (ids.make_id strips `_`, so `_render` and
+        `render` both become `render`), and the second one used to be dropped
+        silently: the symbol never entered the graph at all, and calls to it
+        misattributed to its sibling. Verified live on aethergraph's own source -
+        BlockRuleset.evaluate/_evaluate (the block-enforcement path),
+        WorkingSetPredictor.predict/_predict, Cli.__init__/init, and others.
+
+        The FIRST claimant keeps the unsuffixed id, so no existing anchor or stored
+        symbol_key is rewritten; only the symbol that today does not exist at all
+        gets a new (suffixed) id, which by definition can break no anchor. The
+        suffix comes from the newcomer's own underscore padding, so it is stable
+        across runs rather than a bare visit counter.
+        """
+        if nid in seen_ids and claimed_label.get(nid, label) != label:
+            base = f"{nid}_{_underscore_discriminator(label)}"
+            candidate, n = base, 2
+            while candidate in seen_ids and claimed_label.get(candidate, label) != label:
+                candidate, n = f"{base}_{n}", n + 1
+            nid = candidate
         if nid not in seen_ids:
             seen_ids.add(nid)
+            claimed_label[nid] = label
             nodes.append({
                 "id": nid,
                 "label": label,
@@ -3385,6 +3413,7 @@ def _extract_generic(
                 "source_file": str_path,
                 "source_location": f"L{line}",
             })
+        return nid
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", weight: float = 1.0,
@@ -3487,9 +3516,8 @@ def _extract_generic(
             if not name_node:
                 return
             class_name = _read_text(name_node, source)
-            class_nid = _make_id(stem, class_name)
             line = node.start_point[0] + 1
-            add_node(class_nid, class_name, line)
+            class_nid = add_node(_make_id(stem, class_name), class_name, line)
             add_edge(file_nid, class_nid, "contains", line)
 
             if config.ts_module == "tree_sitter_swift" and any(
@@ -3956,9 +3984,8 @@ def _extract_generic(
                         break
             if name_node is not None:
                 case_name = _read_text(name_node, source)
-                case_nid = _make_id(parent_class_nid, case_name)
                 line = node.start_point[0] + 1
-                add_node(case_nid, case_name, line)
+                case_nid = add_node(_make_id(parent_class_nid, case_name), case_name, line)
                 add_edge(parent_class_nid, case_nid, "case_of", line)
             return
 
@@ -4167,9 +4194,9 @@ def _extract_generic(
                 name = _get_cpp_func_name(decl, source)
                 if name:
                     line = decl.start_point[0] + 1
-                    field_nid = _make_id(parent_class_nid, name)
-                    was_new = field_nid not in seen_ids
-                    add_node(field_nid, name, line)
+                    computed_nid = _make_id(parent_class_nid, name)
+                    was_new = computed_nid not in seen_ids
+                    field_nid = add_node(computed_nid, name, line)
                     # Stash the field's resolved type on the node so cross-file member
                     # calls (`Inventory->x()` in a .cpp, field declared in the .h) can
                     # type the receiver via a corpus-level (class, field) -> type index.
@@ -4213,19 +4240,23 @@ def _extract_generic(
             cpp_ool = None
             if config.ts_module == "tree_sitter_cpp" and parent_class_nid is None:
                 cpp_ool = _cpp_qualified_method_parts(node, source)
+            # add_node returns the id ACTUALLY used - a name colliding with an
+            # underscore-padded sibling is remapped - so every edge and label map
+            # below must use its return value, not the locally computed id.
             if parent_class_nid:
-                func_nid = _make_id(parent_class_nid, func_name)
-                add_node(func_nid, f".{func_name}()", line)
+                func_nid = add_node(
+                    _make_id(parent_class_nid, func_name), f".{func_name}()", line
+                )
                 add_edge(parent_class_nid, func_nid, "method", line)
             elif cpp_ool:
                 cls_name, m_name = cpp_ool
-                func_nid = _make_id(stem, cls_name, m_name)
                 # Label preserves the class qualifier (`UFoo::Bar()`); the corpus pass
                 # _resolve_cpp_calls finds these by shape and links them to the class.
-                add_node(func_nid, f"{cls_name}::{m_name}()", line)
+                func_nid = add_node(
+                    _make_id(stem, cls_name, m_name), f"{cls_name}::{m_name}()", line
+                )
             else:
-                func_nid = _make_id(stem, func_name)
-                add_node(func_nid, f"{func_name}()", line)
+                func_nid = add_node(_make_id(stem, func_name), f"{func_name}()", line)
                 add_edge(file_nid, func_nid, "contains", line)
 
             if config.ts_module == "tree_sitter_python":
@@ -4506,8 +4537,7 @@ def _extract_generic(
                         continue
                     m_name = tgt[2]
                     m_line = stmt.start_point[0] + 1
-                    m_nid = _make_id(this_owner_nid, m_name)
-                    add_node(m_nid, f".{m_name}()", m_line)
+                    m_nid = add_node(_make_id(this_owner_nid, m_name), f".{m_name}()", m_line)
                     add_edge(this_owner_nid, m_nid, "method", m_line)
                     m_body = val.child_by_field_name("body")
                     if m_body:
@@ -9936,6 +9966,23 @@ def _python_collect_module_aliases(root_node, source: bytes, str_path: str) -> d
                 leaf = imported_name.replace(".", "/")
                 aliases[local_name] = f"{prefix}/{leaf}" if prefix else leaf
     return aliases
+
+
+def _underscore_discriminator(label: str) -> str:
+    """A stable id suffix for a symbol whose name collides with a sibling that
+    differs only by underscore padding (``_render`` vs ``render``).
+
+    Derived from the newcomer's own leading/trailing underscore counts, so it is
+    deterministic per symbol rather than a visit counter. Returns ``"n"`` for a
+    name with NO padding, which is the case where the underscored sibling claimed
+    the plain id first - the suffix must still be non-empty or the two collide again.
+    """
+    bare = str(label).lstrip(".")
+    if bare.endswith("()"):
+        bare = bare[:-2]
+    lead = len(bare) - len(bare.lstrip("_"))
+    trail = len(bare) - len(bare.rstrip("_"))
+    return f"u{lead}_{trail}" if (lead or trail) else "n"
 
 
 def _py_module_key(source_file: str) -> str:
