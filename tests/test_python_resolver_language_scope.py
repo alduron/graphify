@@ -59,6 +59,37 @@ def test_python_qualified_call_does_not_bind_to_a_same_named_ts_class(tmp_path: 
             )
 
 
+def test_a_js_call_does_not_bind_to_a_same_named_python_class(tmp_path: Path):
+    """The mirror case. Scoping only the INDEX is not enough - every resolver also iterates the
+    WHOLE corpus's raw calls, so the JS pass would otherwise process a Python call site (and vice
+    versa). Both halves are needed: the calls a pass reads and the definitions it resolves against."""
+    py_def = _write(
+        tmp_path / "widget.py",
+        "class Widget:\n    def render(self):\n        return 'py'\n",
+    )
+    ts_def = _write(
+        tmp_path / "widget.ts",
+        "export class Widget {\n  render() { return 'ts'; }\n}\n",
+    )
+    ts_caller = _write(
+        tmp_path / "app.ts",
+        "import { Widget } from './widget';\nexport function go() { return Widget.render(); }\n",
+    )
+
+    result = extract([py_def, ts_def, ts_caller], cache_root=tmp_path / "cache")
+
+    by_id = {n["id"]: n for n in result["nodes"]}
+    for edge in result["edges"]:
+        if edge["relation"] != "calls":
+            continue
+        src = by_id.get(edge["source"], {})
+        tgt = by_id.get(edge["target"], {})
+        if "go" in str(src.get("label", "")) and str(src.get("source_file", "")).endswith(".ts"):
+            assert not str(tgt.get("source_file", "")).endswith(".py"), (
+                f"js call resolved into python: {tgt}"
+            )
+
+
 def test_a_python_only_class_name_still_resolves(tmp_path: Path):
     """Scoping must not break the normal case it is protecting."""
     py_def = _write(

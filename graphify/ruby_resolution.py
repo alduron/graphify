@@ -55,6 +55,15 @@ def resolve_ruby_member_calls(
     wrong edge.
     """
     node_by_id: dict[str, dict] = {n.get("id"): n for n in all_nodes}
+    # run_language_resolvers gates only ACTIVATION and then hands this pass EVERY language's nodes,
+    # so a name-keyed class index would let a Ruby `Widget.new` bind to a same-named Python/TS
+    # class (Caveat_LanguageResolversReceiveEveryLanguagesNodes). Mirrors extract.lang_scoped_ids,
+    # reimplemented locally because extract imports THIS module - importing back would be circular.
+    ruby_ids = {
+        str(n.get("id"))
+        for n in all_nodes
+        if n.get("id") and str(n.get("source_file") or "").lower().endswith(".rb")
+    }
 
     # class label key -> [class node ids]; (class_node_id, method_key) -> method id
     class_def_nids: dict[str, list[str]] = {}
@@ -64,7 +73,7 @@ def resolve_ruby_member_calls(
             continue
         src, tgt = e.get("source"), e.get("target")
         cnode = node_by_id.get(src)
-        if cnode is not None:
+        if cnode is not None and str(src) in ruby_ids:
             class_def_nids.setdefault(_key(cnode.get("label", "")), []).append(str(src))
         tnode = node_by_id.get(tgt)
         if tnode is not None:
