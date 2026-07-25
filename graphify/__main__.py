@@ -3571,6 +3571,7 @@ def main() -> None:
         no_cluster = False
         files_arg: str | None = None
         out_arg: str | None = None
+        cli_excludes: list[str] = []
         args = sys.argv[2:]
         watch_arg: str | None = None
         i = 0
@@ -3588,11 +3589,18 @@ def main() -> None:
                 out_arg = args[i + 1]; i += 2
             elif a.startswith("--out="):
                 out_arg = a.split("=", 1)[1]; i += 1
+            # --exclude mirrors `extract --exclude` (repeatable, gitignore-style). Without it
+            # `update` walks nested worktrees / nested repo clones under the root, so an
+            # incremental rebuild re-imports their duplicate symbols.
+            elif a == "--exclude" and i + 1 < len(args):
+                cli_excludes.append(args[i + 1]); i += 2
+            elif a.startswith("--exclude="):
+                cli_excludes.append(a.split("=", 1)[1]); i += 1
             elif a.startswith("-"):
                 print(
                     "error: unknown update option: " + a + "\n"
                     "Usage: graphify update [path] [--force] [--no-cluster] "
-                    "[--files <changelist-file>] [--out <dir>]",
+                    "[--files <changelist-file>] [--out <dir>] [--exclude <pattern>]",
                     file=sys.stderr,
                 )
                 sys.exit(2)
@@ -3656,6 +3664,7 @@ def main() -> None:
             no_cluster=no_cluster,
             block_on_lock=True,
             out_dir=out_dir,
+            extra_excludes=cli_excludes or None,
         )
         if ok:
             print("Code graph updated. For doc/paper/image changes run /graphify --update in your AI assistant.")

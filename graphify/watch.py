@@ -424,6 +424,7 @@ def _rebuild_code(
     acquire_lock: bool = True,
     block_on_lock: bool = False,
     out_dir: Path | None = None,
+    extra_excludes: list[str] | None = None,
 ) -> bool:
     """Re-run AST extraction + build + optional cluster + report for code files. No LLM needed.
 
@@ -445,6 +446,13 @@ def _rebuild_code(
 
     ``no_cluster`` skips community detection and writes raw merged extraction
     JSON to graphify-out/graph.json (mirrors ``extract --no-cluster``).
+
+    ``extra_excludes`` are gitignore-style patterns forwarded to ``detect``,
+    mirroring ``extract --exclude``. They matter even on the ``changed_paths``
+    incremental path: the corpus walk below still runs over the whole tree to
+    build the preserved-node set, so without them a nested worktree / nested
+    repo clone under the root is walked and its duplicate symbols land in the
+    graph (the confirmed cause of a repo ballooning past 100k nodes).
 
     ``out_dir`` (default None) redirects graph.json, the rebuild lock, the
     pending-change queue, the AST cache and the manifest to
@@ -494,6 +502,7 @@ def _rebuild_code(
                 no_cluster=no_cluster,
                 acquire_lock=False,
                 out_dir=out_dir,
+                extra_excludes=extra_excludes,
             )
             # Late-arrival drain: another hook may have queued work while we
             # were rebuilding. Loop up to _PENDING_DRAIN_MAX_PASSES times so a
@@ -512,6 +521,7 @@ def _rebuild_code(
                         no_cluster=no_cluster,
                         acquire_lock=False,
                         out_dir=out_dir,
+                        extra_excludes=extra_excludes,
                     ) and ok
             return ok
 
@@ -538,7 +548,7 @@ def _rebuild_code(
             kwargs = {"manifest_path": str(out / "manifest.json")} if out_dir is not None else {}
             save_manifest(files, kind="ast", root=project_root, **kwargs)
 
-        detected = detect(watch_path, follow_symlinks=follow_symlinks)
+        detected = detect(watch_path, follow_symlinks=follow_symlinks, extra_excludes=extra_excludes)
         code_files = [Path(f) for f in detected['files']['code']]
 
         # Include document files that have AST extractors (e.g. .md, .mdx, .qmd)
