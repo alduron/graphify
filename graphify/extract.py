@@ -4580,6 +4580,11 @@ def _extract_generic(
     # / self_field for cross-file resolution in _resolve_python_member_calls.
     python_var_types: dict[str, dict[str, str | None]] = {}
     python_field_types: dict[str, dict[str, str]] = {}
+    # Python: local name -> imported MODULE slash-path, populated before walk_calls
+    # runs. A `module.func()` receiver is a module, not a class, so it resolves in
+    # _resolve_python_module_calls; walk_calls only needs it to know NOT to bind
+    # such a call to a same-named local def (#py-module-calls).
+    python_module_aliases: dict[str, str] = {}
     # JS/TS mirror of python_var_types / python_field_types.
     js_var_types: dict[str, dict[str, str | None]] = {}
     js_field_types: dict[str, dict[str, str]] = {}
@@ -4817,7 +4822,15 @@ def _extract_generic(
                 # assignment or annotation elsewhere in the class), so an
                 # in-file bare-name guess here would risk the same
                 # tgt_nid == caller_nid drop or a wrong same-named method.
-                if is_member_call and ((member_receiver and member_receiver[:1].isupper()) or self_field):
+                # A module-qualified call (`pushv2.flag_nodes()`) must defer too: the
+                # callee lives in the IMPORTED MODULE, so an in-file bare-name lookup
+                # would silently bind it to a same-named local def. Resolved for real
+                # in _resolve_python_module_calls.
+                if is_member_call and (
+                    (member_receiver and member_receiver[:1].isupper())
+                    or self_field
+                    or (member_receiver and member_receiver in python_module_aliases)
+                ):
                     tgt_nid = None
                 else:
                     tgt_nid = label_to_nid.get(callee_name)
@@ -5015,6 +5028,7 @@ def _extract_generic(
             param_types = _python_param_types(python_func_params.get(caller_nid), source)
             python_var_types[caller_nid] = _python_local_var_types(body_node, source, param_types)
         python_field_types = _python_collect_self_field_types(root, source)
+        python_module_aliases = _python_collect_module_aliases(root, source, str_path)
 
     if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
         for caller_nid, body_node in function_bodies:
@@ -5072,6 +5086,8 @@ def _extract_generic(
             result["swift_type_table"] = {"path": str_path, "table": type_table}
     if python_field_types:
         result["python_field_types"] = {"path": str_path, "table": python_field_types}
+    if python_module_aliases:
+        result["python_module_aliases"] = {"path": str_path, "table": python_module_aliases}
     if js_field_types:
         result["js_field_types"] = {"path": str_path, "table": js_field_types}
     return result
@@ -9866,6 +9882,73 @@ def _python_imported_names(node, source: bytes) -> list[tuple[str, str]]:
     return names
 
 
+def _python_collect_module_aliases(root_node, source: bytes, str_path: str) -> dict[str, str]:
+    """Local name -> imported MODULE slash-path (no extension), for this file.
+
+    ``module.func()`` is the dominant Python call style, but the receiver is a
+    module rather than a class, so neither the in-file bare-name lookup nor
+    _resolve_python_member_calls (class receivers only) can reach the callee. This
+    table is what lets _resolve_python_module_calls resolve it exactly.
+
+    ``import pkg.mod as m`` -> {"m": "pkg/mod"}; ``import mod`` -> {"mod": "mod"};
+    ``from pkg import mod`` -> {"mod": "pkg/mod"}; ``from . import mod`` and
+    ``from .sub import mod`` resolve against this file's own directory.
+
+    A plain symbol import (``from pkg import func``) also lands here, as
+    "pkg/func"; it simply matches no module file and is ignored downstream, so no
+    special-casing is needed to tell a module import from a symbol import here.
+    """
+    aliases: dict[str, str] = {}
+    base_dir = Path(str_path).parent
+    for node in _walk_python_tree(root_node):
+        t = node.type
+        if t == "import_statement":
+            for child in node.children:
+                if child.type == "dotted_name":
+                    # `import pkg.mod` binds only the ROOT name (`pkg`).
+                    head = _read_text(child, source).split(".")[0]
+                    if head:
+                        aliases[head] = head
+                elif child.type == "aliased_import":
+                    name_node = child.child_by_field_name("name")
+                    alias_node = child.child_by_field_name("alias")
+                    if name_node is None or alias_node is None:
+                        continue
+                    aliases[_read_text(alias_node, source)] = _read_text(
+                        name_node, source
+                    ).replace(".", "/")
+        elif t == "import_from_statement":
+            module = _python_import_from_module(node, source)
+            if module is None:
+                continue
+            level, module_name = module
+            if level > 0:
+                d = base_dir
+                for _ in range(level - 1):
+                    d = d.parent
+                prefix = str(d / module_name.replace(".", "/")) if module_name else str(d)
+            else:
+                prefix = module_name.replace(".", "/")
+            prefix = prefix.replace("\\", "/").strip("/")
+            for imported_name, local_name in _python_imported_names(node, source):
+                if imported_name == "*":
+                    continue
+                leaf = imported_name.replace(".", "/")
+                aliases[local_name] = f"{prefix}/{leaf}" if prefix else leaf
+    return aliases
+
+
+def _py_module_key(source_file: str) -> str:
+    """A .py path reduced to its importable module path (``a/b/mod.py`` -> ``a/b/mod``,
+    ``a/b/__init__.py`` -> ``a/b``), so an import's slash-path can match it by suffix."""
+    key = str(source_file).replace("\\", "/")
+    if key.endswith("/__init__.py"):
+        return key[: -len("/__init__.py")]
+    if key == "__init__.py":
+        return ""
+    return key[:-3] if key.endswith(".py") else key
+
+
 def _resolve_python_module_path(module_name: str, current_path: Path, root: Path, level: int) -> Path | None:
     if level > 0:
         base = current_path.parent
@@ -10755,6 +10838,117 @@ def _resolve_python_member_calls(
         _emit(caller, lookup_method(cls_nid, mk), "EXTRACTED", 1.0, rc)
 
 
+def _resolve_python_module_calls(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Resolve cross-file Python MODULE-qualified calls (``pushv2.flag_nodes()``).
+
+    ``from pkg import mod`` + ``mod.func()`` is the dominant Python call style, yet
+    it produced NO call edge at all: the in-file pass cannot find the callee (it
+    lives in another file) and _resolve_python_member_calls only ever resolves a
+    receiver that names a CLASS, so a lowercase module receiver was dropped
+    outright. Callers/callees, impact slices and read-hint targeting were all
+    silently under-reporting every such call.
+
+    Resolution here is exact rather than inferred: the file's own import table
+    binds the receiver to one module, and the callee name is looked up only among
+    that module's own module-level definitions. Guards, each of which bails rather
+    than guess: the import must resolve to exactly one module file in the corpus,
+    the name must be defined exactly once there, and class-owned methods are
+    excluded (``mod.method()`` can never name one).
+
+    Must run after id-disambiguation so node ids and caller_nids are final.
+    """
+    aliases_by_file: dict[str, dict[str, str]] = {}
+    for result in per_file:
+        ma = result.get("python_module_aliases")
+        if ma and ma.get("path"):
+            aliases_by_file[ma["path"]] = ma.get("table", {})
+    if not aliases_by_file:
+        return
+
+    # Only module-level definitions are reachable by `mod.name()`. Excluding every
+    # target of a `method` edge keeps a class's method from shadowing a same-named
+    # module function in the same file.
+    method_targets = {e.get("target") for e in all_edges if e.get("relation") == "method"}
+    defs_by_module: dict[str, dict[str, list[str]]] = {}
+    for n in all_nodes:
+        nid, sf, label = n.get("id"), n.get("source_file"), n.get("label")
+        if not nid or not sf or not label or nid in method_targets:
+            continue
+        if not str(sf).endswith(".py"):
+            continue
+        # A node label is decorated (`func()`, `.method()`); a raw call's callee is the
+        # bare name, so index by the undecorated form.
+        bare = str(label).lstrip(".")
+        if bare.endswith("()"):
+            bare = bare[:-2]
+        if not bare:
+            continue
+        defs_by_module.setdefault(_py_module_key(sf), {}).setdefault(bare, []).append(nid)
+    if not defs_by_module:
+        return
+
+    # Bucket by last path segment so suffix matching stays O(candidates), not O(corpus).
+    by_last: dict[str, list[str]] = {}
+    for k in defs_by_module:
+        by_last.setdefault(k.rsplit("/", 1)[-1], []).append(k)
+
+    module_cache: dict[str, str | None] = {}
+
+    def resolve_module(mod_path: str) -> str | None:
+        """The one corpus module whose path ends with this import path, else None."""
+        if mod_path not in module_cache:
+            if mod_path in defs_by_module:
+                module_cache[mod_path] = mod_path
+            else:
+                cands = by_last.get(mod_path.rsplit("/", 1)[-1], [])
+                suffix = "/" + mod_path
+                hits = [k for k in cands if k.endswith(suffix)]
+                module_cache[mod_path] = hits[0] if len(hits) == 1 else None
+        return module_cache[mod_path]
+
+    existing_pairs = {(e.get("source"), e.get("target")) for e in all_edges}
+    for result in per_file:
+        for rc in result.get("raw_calls", []):
+            if not rc.get("is_member_call"):
+                continue
+            receiver, callee, caller = rc.get("receiver"), rc.get("callee"), rc.get("caller_nid")
+            if not receiver or not callee or not caller:
+                continue
+            table = aliases_by_file.get(rc.get("source_file", ""))
+            if not table:
+                continue
+            mod_path = table.get(receiver)
+            if not mod_path:
+                continue
+            mod_key = resolve_module(mod_path)
+            if mod_key is None:
+                continue
+            targets = defs_by_module.get(mod_key, {}).get(callee, [])
+            if len(targets) != 1:
+                continue
+            target = targets[0]
+            if target == caller or (caller, target) in existing_pairs:
+                continue
+            existing_pairs.add((caller, target))
+            all_edges.append({
+                "source": caller,
+                "target": target,
+                "relation": "calls",
+                "context": "call",
+                # An explicit import binding plus an explicit qualified name is as
+                # certain as a bare same-file call, so EXTRACTED (not INFERRED).
+                "confidence": "EXTRACTED",
+                "confidence_score": 1.0,
+                "source_file": rc.get("source_file", ""),
+                "source_location": rc.get("source_location"),
+                "weight": 1.0,
+            })
+
+
 def _resolve_js_member_calls(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -11182,6 +11376,12 @@ register_language_resolver(
 )
 register_language_resolver(
     LanguageResolver("python_member_calls", frozenset({".py"}), _resolve_python_member_calls)
+)
+# Module-qualified calls (`mod.func()` after `from pkg import mod`). Runs AFTER the
+# class-receiver resolver so a receiver that is genuinely a class keeps that path's
+# result; both dedupe against edges already emitted.
+register_language_resolver(
+    LanguageResolver("python_module_calls", frozenset({".py"}), _resolve_python_module_calls)
 )
 # JS/TS type-aware member-call resolution (new Thing() / this.<field> / typed
 # param / typed local var / qualified Helper.method()). Suffix set matches
