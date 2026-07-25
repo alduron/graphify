@@ -4770,6 +4770,24 @@ def main() -> None:
             "output_tokens": ast_result.get("output_tokens", 0) + sem_result.get("output_tokens", 0),
         }
 
+        # Extraction-horizon sections (Plan 08 Phase 5): a NAMES-ONLY index of
+        # registered name literals (gameplay tags, events, config keys) and
+        # opaque Unreal asset records. Additive + versioned so an older CLI that
+        # reads only nodes/links ignores them. GRAPHIFY_HORIZON=0 is the rollback
+        # lever. Never blocks extraction - failures degrade to empty sections.
+        horizon: dict = {}
+        if os.environ.get("GRAPHIFY_HORIZON", "1").strip().lower() not in ("0", "false", "no", "off"):
+            try:
+                from graphify.horizon import build_horizon_sections as _build_horizon
+                horizon = _build_horizon(code_files, target)
+                print(
+                    f"[graphify extract] horizon: {len(horizon.get('literals', []))} literals, "
+                    f"{len(horizon.get('assets', []))} opaque assets"
+                )
+            except Exception as exc:  # noqa: BLE001 - horizon is best-effort, never fatal
+                print(f"[graphify extract] warning: horizon indexing failed: {exc}", file=sys.stderr)
+                horizon = {}
+
         graph_json_path = graphify_out / "graph.json"
         analysis_path = graphify_out / ".graphify_analysis.json"
 
@@ -4830,6 +4848,8 @@ def main() -> None:
                         _node_sf.get(_e.get("source")) or _node_sf.get(_e.get("target")) or ""
                     )
             _backup(graphify_out)
+            if horizon:
+                merged.update(horizon)
             graph_json_path.write_text(
                 json.dumps(merged, indent=2), encoding="utf-8"
             )
@@ -4914,7 +4934,7 @@ def main() -> None:
 
         from graphify.export import backup_if_protected as _backup
         _backup(graphify_out)
-        _to_json(G, communities, str(graph_json_path), force=True)
+        _to_json(G, communities, str(graph_json_path), force=True, extra_sections=horizon or None)
         stages.mark("export")
         if merged.get("output_tokens", 0) > 0:
             (graphify_out / ".graphify_semantic_marker").write_text(
