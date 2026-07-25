@@ -11042,10 +11042,28 @@ def _resolve_python_member_calls(
                 _emit(caller, lookup_method(cls_nid, mk), "INFERRED", 0.8, rc)
             continue
 
-        # Original #1446 path: only a capitalized receiver is treated as a
-        # class reference, so an instance/module (`self`, `obj`, `config`)
-        # never collides with a same-spelled class via the case-folding key.
         receiver = rc.get("receiver")
+
+        # `self.method()` / `cls.method()`: the receiver's class is the caller's OWN enclosing class,
+        # which is known EXACTLY - this is not inference and not a guess, so it is not covered by
+        # Decision_PythonUntypedReceiverEmitsNoEdge (that governs a receiver whose type is genuinely
+        # unknowable, like an unannotated parameter). Resolution walks the caller's class and then up
+        # its bases via lookup_method, so an INHERITED method defined in another file resolves too;
+        # previously only a same-file, same-class method resolved (by bare-name lookup in the
+        # per-file pass) and every inherited or cross-file self-call produced NO edge.
+        #
+        # EXTRACTED, not INFERRED: `self` names exactly one class in source, the same standard the
+        # qualified `ClassName.method()` path uses. Bounded to one class hierarchy, so it carries no
+        # god-node risk (#543/#1219) - the concern that motivates the untyped-receiver policy.
+        if receiver in ("self", "cls"):
+            owner_nid = owner_class_of.get(caller)
+            if owner_nid:
+                _emit(caller, lookup_method(owner_nid, mk), "EXTRACTED", 1.0, rc)
+            continue
+
+        # Original #1446 path: only a capitalized receiver is treated as a
+        # class reference, so an instance/module (`obj`, `config`)
+        # never collides with a same-spelled class via the case-folding key.
         if not receiver or not receiver[:1].isupper():
             # UNTYPED receiver (`obj.method()` on an unannotated local/parameter). Python
             # deliberately emits NOTHING here, unlike C++/JS which fall back to a corpus-unique
