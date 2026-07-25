@@ -154,6 +154,56 @@ def test_update_files_flag_incremental_rebuild(tmp_path):
     assert "drop_fn()" not in after_labels, "deleted file's nodes must be evicted"
 
 
+def test_update_exclude_flag_keeps_a_nested_worktree_out_of_the_graph(tmp_path):
+    """`graphify update --exclude <pattern>` must keep an excluded directory out of the
+    rebuild, exactly like `extract --exclude`.
+
+    Regression: `update` rejected --exclude outright (exit 2, "unknown update option"),
+    which made the AetherGraph CLI's every incremental sync fall back to a full extract.
+    Simply accepting-and-ignoring the flag would be worse than the crash: `_rebuild_code`
+    walks the WHOLE tree via detect() to build its preserved-node set even on the --files
+    path, so an unexcluded nested worktree / nested repo clone re-imports its duplicate
+    symbols on every sync. This asserts the pattern is actually honoured, not just parsed.
+    """
+    proj = _make_three_file_project(tmp_path)
+    # A nested checkout of the same project, the shape that ballooned a real repo past 100k nodes.
+    nested = proj / "proj-wt-feature"
+    nested.mkdir()
+    (nested / "nested_copy.py").write_text("def nested_only_fn():\n    return 99\n", encoding="utf-8")
+
+    # Baseline: with no --exclude the nested copy IS extracted, so the assertions below are
+    # about the flag doing work rather than about the corpus happening not to contain it.
+    r0 = _run(["extract", str(proj), "--no-cluster"], tmp_path)
+    assert r0.returncode == 0, r0.stderr
+    gj = proj / "graphify-out" / "graph.json"
+    assert "nested_only_fn()" in _node_labels(gj), "baseline: nested copy is in scope without --exclude"
+
+    r1 = _run(["extract", str(proj), "--no-cluster", "--exclude", "proj-wt-feature"], tmp_path)
+    assert r1.returncode == 0, r1.stderr
+    assert "nested_only_fn()" not in _node_labels(gj), "extract --exclude should already hold"
+
+    # The full-corpus update path re-extracts everything, so an unexcluded nested copy comes
+    # straight back. This is the assertion that fails if --exclude is parsed but not forwarded.
+    (proj / "keep.py").write_text("def keep_fn():\n    return 11\n", encoding="utf-8")
+    r2 = _run(["update", str(proj), "--no-cluster", "--exclude", "proj-wt-feature"], tmp_path)
+    assert r2.returncode == 0, r2.stderr
+
+    after_labels = _node_labels(gj)
+    assert "keep_fn()" in after_labels, "the changed file must still be re-extracted"
+    assert "nested_only_fn()" not in after_labels, (
+        "the excluded nested worktree must stay out of the graph on the update path too"
+    )
+
+
+def test_update_rejects_an_unknown_option_with_usage(tmp_path):
+    """An genuinely unknown flag still exits 2 and names the supported set (incl. --exclude)."""
+    proj = _make_three_file_project(tmp_path)
+    r = _run(["update", str(proj), "--definitely-not-a-flag"], tmp_path)
+    assert r.returncode == 2
+    assert "unknown update option: --definitely-not-a-flag" in r.stderr
+    assert "--exclude <pattern>" in r.stderr
+
+
 def test_update_files_and_out_flag_write_outside_project_tree(tmp_path):
     """`graphify update --files ... --out DIR` must resolve graph.json/cache/lock
     under DIR/graphify-out/ (mirroring `graphify extract --out DIR`), never
