@@ -3375,7 +3375,29 @@ def _extract_generic(
     if config.ts_module == "tree_sitter_swift":
         swift_protocol_names, swift_class_names = _swift_pre_scan(root, source)
 
-    def add_node(nid: str, label: str, line: int) -> None:
+    # id -> the label that claimed it, so a GENUINE collision (two different
+    # symbols) is told apart from the same symbol being visited twice.
+    claimed_label: dict[str, str] = {}
+
+    def add_node(nid: str, label: str, line: int) -> str:
+        """Append the node and return the id ACTUALLY used.
+
+        Callers must use the RETURNED id for edges and label maps, because a
+        colliding id gets remapped here. Names that differ only by underscore
+        padding normalize onto ONE id (ids.make_id strips `_`, so `_render` and
+        `render` both become `render`), and the second one used to be dropped
+        silently: the symbol never entered the graph at all, and calls to it
+        misattributed to its sibling. Verified live on aethergraph's own source -
+        BlockRuleset.evaluate/_evaluate (the block-enforcement path),
+        WorkingSetPredictor.predict/_predict, Cli.__init__/init, and others.
+
+        The FIRST claimant keeps the unsuffixed id, so no existing anchor or stored
+        symbol_key is rewritten; only the symbol that today does not exist at all
+        gets a new (suffixed) id, which by definition can break no anchor. The
+        suffix comes from the newcomer's own underscore padding, so it is stable
+        across runs rather than a bare visit counter.
+        """
+        nid = _claim_nid(nid, label, seen_ids, claimed_label)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({
@@ -3385,6 +3407,7 @@ def _extract_generic(
                 "source_file": str_path,
                 "source_location": f"L{line}",
             })
+        return nid
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", weight: float = 1.0,
@@ -3487,9 +3510,8 @@ def _extract_generic(
             if not name_node:
                 return
             class_name = _read_text(name_node, source)
-            class_nid = _make_id(stem, class_name)
             line = node.start_point[0] + 1
-            add_node(class_nid, class_name, line)
+            class_nid = add_node(_make_id(stem, class_name), class_name, line)
             add_edge(file_nid, class_nid, "contains", line)
 
             if config.ts_module == "tree_sitter_swift" and any(
@@ -3956,9 +3978,8 @@ def _extract_generic(
                         break
             if name_node is not None:
                 case_name = _read_text(name_node, source)
-                case_nid = _make_id(parent_class_nid, case_name)
                 line = node.start_point[0] + 1
-                add_node(case_nid, case_name, line)
+                case_nid = add_node(_make_id(parent_class_nid, case_name), case_name, line)
                 add_edge(parent_class_nid, case_nid, "case_of", line)
             return
 
@@ -4167,9 +4188,9 @@ def _extract_generic(
                 name = _get_cpp_func_name(decl, source)
                 if name:
                     line = decl.start_point[0] + 1
-                    field_nid = _make_id(parent_class_nid, name)
-                    was_new = field_nid not in seen_ids
-                    add_node(field_nid, name, line)
+                    computed_nid = _make_id(parent_class_nid, name)
+                    was_new = computed_nid not in seen_ids
+                    field_nid = add_node(computed_nid, name, line)
                     # Stash the field's resolved type on the node so cross-file member
                     # calls (`Inventory->x()` in a .cpp, field declared in the .h) can
                     # type the receiver via a corpus-level (class, field) -> type index.
@@ -4213,19 +4234,23 @@ def _extract_generic(
             cpp_ool = None
             if config.ts_module == "tree_sitter_cpp" and parent_class_nid is None:
                 cpp_ool = _cpp_qualified_method_parts(node, source)
+            # add_node returns the id ACTUALLY used - a name colliding with an
+            # underscore-padded sibling is remapped - so every edge and label map
+            # below must use its return value, not the locally computed id.
             if parent_class_nid:
-                func_nid = _make_id(parent_class_nid, func_name)
-                add_node(func_nid, f".{func_name}()", line)
+                func_nid = add_node(
+                    _make_id(parent_class_nid, func_name), f".{func_name}()", line
+                )
                 add_edge(parent_class_nid, func_nid, "method", line)
             elif cpp_ool:
                 cls_name, m_name = cpp_ool
-                func_nid = _make_id(stem, cls_name, m_name)
                 # Label preserves the class qualifier (`UFoo::Bar()`); the corpus pass
                 # _resolve_cpp_calls finds these by shape and links them to the class.
-                add_node(func_nid, f"{cls_name}::{m_name}()", line)
+                func_nid = add_node(
+                    _make_id(stem, cls_name, m_name), f"{cls_name}::{m_name}()", line
+                )
             else:
-                func_nid = _make_id(stem, func_name)
-                add_node(func_nid, f"{func_name}()", line)
+                func_nid = add_node(_make_id(stem, func_name), f"{func_name}()", line)
                 add_edge(file_nid, func_nid, "contains", line)
 
             if config.ts_module == "tree_sitter_python":
@@ -4506,8 +4531,7 @@ def _extract_generic(
                         continue
                     m_name = tgt[2]
                     m_line = stmt.start_point[0] + 1
-                    m_nid = _make_id(this_owner_nid, m_name)
-                    add_node(m_nid, f".{m_name}()", m_line)
+                    m_nid = add_node(_make_id(this_owner_nid, m_name), f".{m_name}()", m_line)
                     add_edge(this_owner_nid, m_nid, "method", m_line)
                     m_body = val.child_by_field_name("body")
                     if m_body:
@@ -4580,6 +4604,11 @@ def _extract_generic(
     # / self_field for cross-file resolution in _resolve_python_member_calls.
     python_var_types: dict[str, dict[str, str | None]] = {}
     python_field_types: dict[str, dict[str, str]] = {}
+    # Python: local name -> imported MODULE slash-path, populated before walk_calls
+    # runs. A `module.func()` receiver is a module, not a class, so it resolves in
+    # _resolve_python_module_calls; walk_calls only needs it to know NOT to bind
+    # such a call to a same-named local def (#py-module-calls).
+    python_module_aliases: dict[str, str] = {}
     # JS/TS mirror of python_var_types / python_field_types.
     js_var_types: dict[str, dict[str, str | None]] = {}
     js_field_types: dict[str, dict[str, str]] = {}
@@ -4817,7 +4846,15 @@ def _extract_generic(
                 # assignment or annotation elsewhere in the class), so an
                 # in-file bare-name guess here would risk the same
                 # tgt_nid == caller_nid drop or a wrong same-named method.
-                if is_member_call and ((member_receiver and member_receiver[:1].isupper()) or self_field):
+                # A module-qualified call (`pushv2.flag_nodes()`) must defer too: the
+                # callee lives in the IMPORTED MODULE, so an in-file bare-name lookup
+                # would silently bind it to a same-named local def. Resolved for real
+                # in _resolve_python_module_calls.
+                if is_member_call and (
+                    (member_receiver and member_receiver[:1].isupper())
+                    or self_field
+                    or (member_receiver and member_receiver in python_module_aliases)
+                ):
                     tgt_nid = None
                 else:
                     tgt_nid = label_to_nid.get(callee_name)
@@ -5015,6 +5052,7 @@ def _extract_generic(
             param_types = _python_param_types(python_func_params.get(caller_nid), source)
             python_var_types[caller_nid] = _python_local_var_types(body_node, source, param_types)
         python_field_types = _python_collect_self_field_types(root, source)
+        python_module_aliases = _python_collect_module_aliases(root, source, str_path)
 
     if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
         for caller_nid, body_node in function_bodies:
@@ -5072,6 +5110,8 @@ def _extract_generic(
             result["swift_type_table"] = {"path": str_path, "table": type_table}
     if python_field_types:
         result["python_field_types"] = {"path": str_path, "table": python_field_types}
+    if python_module_aliases:
+        result["python_module_aliases"] = {"path": str_path, "table": python_module_aliases}
     if js_field_types:
         result["js_field_types"] = {"path": str_path, "table": js_field_types}
     return result
@@ -5756,7 +5796,9 @@ def extract_apex(path: Path) -> dict:
     edges: list[dict] = []
     seen_ids: set[str] = set()
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({
@@ -6003,7 +6045,9 @@ def extract_dart(path: Path) -> dict:
     edges = []
     defined: set[str] = set()
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, ftype: str = "code", source_file: str | None = str(path)) -> None:
+        nid = _claim_nid(nid, label, defined, _claimed_nids)
         if nid not in defined:
             nodes.append({"id": nid, "label": label, "file_type": ftype,
                           "source_file": source_file, "source_location": None})
@@ -6590,7 +6634,9 @@ def _augment_systemverilog_semantics(
     def line_for(offset: int) -> int:
         return raw.count("\n", 0, offset) + 1
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({"id": nid, "label": label, "file_type": "code",
@@ -6700,7 +6746,9 @@ def extract_verilog(path: Path) -> dict:
     edges: list[dict] = []
     seen_ids: set[str] = set()
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({"id": nid, "label": label, "file_type": "code",
@@ -7107,7 +7155,9 @@ def extract_julia(path: Path) -> dict:
     seen_ids: set[str] = set()
     function_bodies: list[tuple[str, object]] = []
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({
@@ -7397,7 +7447,9 @@ def extract_fortran(path: Path) -> dict:
     seen_ids: set[str] = set()
     scope_bodies: list[tuple[str, object]] = []
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({
@@ -7654,7 +7706,9 @@ def extract_go(path: Path) -> dict:
     function_bodies: list[tuple[str, object]] = []
     go_imported_pkgs: set[str] = set()  # local names of imported packages
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({
@@ -8009,7 +8063,9 @@ def extract_rust(path: Path) -> dict:
     seen_ids: set[str] = set()
     function_bodies: list[tuple[str, object]] = []
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({
@@ -8307,7 +8363,9 @@ def extract_powershell(path: Path) -> dict:
     seen_ids: set[str] = set()
     function_bodies: list[tuple[str, Any]] = []
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({"id": nid, "label": label, "file_type": "code",
@@ -8647,7 +8705,9 @@ def extract_powershell_manifest(path: Path) -> dict:
     edges: list[dict] = []
     seen_ids: set[str] = set()
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({"id": nid, "label": label, "file_type": "code",
@@ -9866,6 +9926,234 @@ def _python_imported_names(node, source: bytes) -> list[tuple[str, str]]:
     return names
 
 
+def _python_collect_module_aliases(root_node, source: bytes, str_path: str) -> dict[str, str]:
+    """Local name -> imported MODULE slash-path (no extension), for this file.
+
+    ``module.func()`` is the dominant Python call style, but the receiver is a
+    module rather than a class, so neither the in-file bare-name lookup nor
+    _resolve_python_member_calls (class receivers only) can reach the callee. This
+    table is what lets _resolve_python_module_calls resolve it exactly.
+
+    ``import pkg.mod as m`` -> {"m": "pkg/mod"}; ``import mod`` -> {"mod": "mod"};
+    ``from pkg import mod`` -> {"mod": "pkg/mod"}; ``from . import mod`` and
+    ``from .sub import mod`` resolve against this file's own directory.
+
+    A plain symbol import (``from pkg import func``) also lands here, as
+    "pkg/func"; it simply matches no module file and is ignored downstream, so no
+    special-casing is needed to tell a module import from a symbol import here.
+    """
+    aliases: dict[str, str] = {}
+    base_dir = Path(str_path).parent
+    for node in _walk_python_tree(root_node):
+        t = node.type
+        if t == "import_statement":
+            for child in node.children:
+                if child.type == "dotted_name":
+                    # `import pkg.mod` binds only the ROOT name (`pkg`).
+                    head = _read_text(child, source).split(".")[0]
+                    if head:
+                        aliases[head] = head
+                elif child.type == "aliased_import":
+                    name_node = child.child_by_field_name("name")
+                    alias_node = child.child_by_field_name("alias")
+                    if name_node is None or alias_node is None:
+                        continue
+                    aliases[_read_text(alias_node, source)] = _read_text(
+                        name_node, source
+                    ).replace(".", "/")
+        elif t == "import_from_statement":
+            module = _python_import_from_module(node, source)
+            if module is None:
+                continue
+            level, module_name = module
+            if level > 0:
+                d = base_dir
+                for _ in range(level - 1):
+                    d = d.parent
+                prefix = str(d / module_name.replace(".", "/")) if module_name else str(d)
+            else:
+                prefix = module_name.replace(".", "/")
+            prefix = prefix.replace("\\", "/").strip("/")
+            for imported_name, local_name in _python_imported_names(node, source):
+                if imported_name == "*":
+                    continue
+                leaf = imported_name.replace(".", "/")
+                aliases[local_name] = f"{prefix}/{leaf}" if prefix else leaf
+    return aliases
+
+
+def _summarize_unresolved_calls(
+    per_file: list[dict], all_edges: list[dict], all_nodes: list[dict]
+) -> dict:
+    """Count call sites that produced NO edge, bucketed by file extension.
+
+    This is the missing feedback loop behind a whole bug class. Call resolution is a
+    chain of per-shape resolvers, and a call shape that no resolver claims yields
+    SILENCE - no edge, no error, no warning. Two real defects hid in that silence
+    for months: Python module-qualified calls (`mod.func()`, no resolver at all) and
+    underscore-padded sibling symbols (dropped at node creation). Both were found by
+    a human noticing a wrong answer, which is not a detection strategy.
+
+    Reporting the count per language turns "callers looks empty" into a number that
+    can be watched, compared across runs, and regression-gated. Cheap: one pass over
+    raw_calls, no extra parsing. `unresolved_ratio` is the headline - a language
+    whose ratio jumps has almost certainly grown a call shape nothing claims.
+    """
+    # Exact per-callsite attribution: every call edge carries the source_location of
+    # the call site that produced it, so (caller, location) identifies the site. A
+    # caller-level check would count a function that only calls stdlib as "unresolved"
+    # and drown the signal in noise.
+    resolved_sites = {
+        (e.get("source"), e.get("source_location"))
+        for e in all_edges
+        if e.get("relation") == "calls"
+    }
+    # Undecorated names this corpus actually DEFINES. An unresolved call to one of these is a
+    # missing LINK (the target exists and we failed to reach it); an unresolved call to anything
+    # else is external - stdlib/third-party - and legitimately has no edge. Without this split the
+    # raw ratio is uninterpretable, because most unresolved calls are always going to be external.
+    defined: set[str] = set()
+    for n in all_nodes:
+        label = str(n.get("label") or "").lstrip(".")
+        if label.endswith("()"):
+            label = label[:-2]
+        if label:
+            defined.add(label)
+
+    by_ext: dict[str, dict[str, int]] = {}
+    for result in per_file:
+        for rc in result.get("raw_calls", []):
+            source_file = str(rc.get("source_file", ""))
+            ext = Path(source_file).suffix.lower() or "<none>"
+            bucket = by_ext.setdefault(
+                ext, {"total": 0, "unresolved": 0, "member": 0, "first_party": 0}
+            )
+            bucket["total"] += 1
+            if (rc.get("caller_nid"), rc.get("source_location")) not in resolved_sites:
+                bucket["unresolved"] += 1
+                if rc.get("is_member_call"):
+                    bucket["member"] += 1
+                if str(rc.get("callee") or "") in defined:
+                    bucket["first_party"] += 1
+    for bucket in by_ext.values():
+        bucket["unresolved_ratio"] = (
+            round(bucket["unresolved"] / bucket["total"], 4) if bucket["total"] else 0.0
+        )
+        # THE number to watch: unresolved calls whose target this corpus defines. Every one of these
+        # is a link the graph should have and does not. Unlike unresolved_ratio it has a meaningful
+        # target - zero - so it can be regression-gated directly.
+        bucket["first_party_ratio"] = (
+            round(bucket["first_party"] / bucket["total"], 4) if bucket["total"] else 0.0
+        )
+    return by_ext
+
+
+# ONE definition per language, shared by the resolver registration below AND by each resolver's
+# own lang_scoped_ids() gate - so the set a pass ACTIVATES on can never drift from the set it
+# RESOLVES against.
+_SWIFT_SUFFIXES = frozenset({".swift"})
+_PY_SUFFIXES = frozenset({".py"})
+_JS_SUFFIXES = frozenset({".js", ".jsx", ".mjs", ".ts", ".tsx"})
+_RUBY_SUFFIXES = frozenset({".rb"})
+_CPP_SUFFIXES = frozenset({".cpp", ".cc", ".cxx", ".hpp", ".cu", ".cuh", ".metal", ".h"})
+
+
+def lang_scoped_ids(all_nodes: list[dict], suffixes: frozenset[str]) -> set[str]:
+    """Ids of nodes DEFINED in one of ``suffixes`` - the language gate every resolver needs.
+
+    run_language_resolvers gates only ACTIVATION (a pass runs when the corpus contains any file
+    with its suffix) and then hands it the ENTIRE node/edge set, every language included. The
+    ``suffixes`` field reads like a filter and is not one. So any NAME-KEYED index a resolver
+    builds (class label -> nid, method key -> nid) silently spans languages, and in a polyglot
+    repo a Python ``Widget.render()`` can bind to a TypeScript class named ``Widget`` - a wrong
+    edge, emitted with no error (Caveat_LanguageResolversReceiveEveryLanguagesNodes).
+
+    A node with no source_file (a sourceless cross-file stub) is deliberately EXCLUDED: it has no
+    language, so letting it into a scoped index would reopen the same hole it closes.
+    """
+    scoped: set[str] = set()
+    for node in all_nodes:
+        source_file = str(node.get("source_file") or "").lower()
+        nid = node.get("id")
+        if nid and source_file and any(source_file.endswith(s) for s in suffixes):
+            scoped.add(str(nid))
+    return scoped
+
+
+def lang_raw_calls(per_file: list[dict], suffixes: frozenset[str]) -> list[dict]:
+    """Unresolved calls made FROM a file of this language - the OTHER half of language scoping.
+
+    Scoping a resolver's name-keyed index is not enough on its own: every resolver also iterates
+    the raw calls of the WHOLE corpus, so a JS pass would happily process a Python call site and
+    bind its `Widget.render()` to a TypeScript class. Both halves are required - the calls it reads
+    and the definitions it resolves against must be the same language.
+
+    _ruby_raw_calls in graphify.ruby_resolution already did exactly this; this is that pattern
+    generalized so the remaining resolvers stop being the exception.
+    """
+    calls: list[dict] = []
+    for result in per_file:
+        if not isinstance(result, dict):
+            continue
+        for rc in result.get("raw_calls", []):
+            if not isinstance(rc, dict):
+                continue
+            source_file = str(rc.get("source_file", "")).lower()
+            if any(source_file.endswith(s) for s in suffixes):
+                calls.append(rc)
+    return calls
+
+
+def _claim_nid(nid: str, label: str, seen_ids: set[str], claimed: dict[str, str]) -> str:
+    """The id (nid, label) should actually occupy, disambiguating a GENUINE collision.
+
+    Shared by every extractor's ``add_node``. Two symbols whose names differ only by underscore
+    padding normalize onto one id (ids.make_id strips ``_``, so ``_render`` and ``render`` both
+    become ``render``); without this the second one hits ``nid in seen_ids`` and is never appended,
+    so the symbol is absent from the graph entirely and calls to it misattribute to its sibling.
+
+    The FIRST claimant keeps the unsuffixed id, so no stored anchor or symbol_key is rewritten and
+    a non-colliding underscore-named symbol never churns; only the symbol that today does not exist
+    at all receives a new id, which by definition can break no anchor.
+    """
+    if nid in seen_ids and claimed.get(nid, label) != label:
+        base = f"{nid}_{_underscore_discriminator(label)}"
+        candidate, n = base, 2
+        while candidate in seen_ids and claimed.get(candidate, label) != label:
+            candidate, n = f"{base}_{n}", n + 1
+        nid = candidate
+    claimed.setdefault(nid, label)
+    return nid
+
+
+def _underscore_discriminator(label: str) -> str:
+    """A stable id suffix for a symbol whose name collides with a sibling that
+    differs only by underscore padding (``_render`` vs ``render``).
+
+    Derived from the newcomer's own leading/trailing underscore counts, so it is
+    deterministic per symbol rather than a visit counter. Returns ``"n"`` for a
+    name with NO padding, which is the case where the underscored sibling claimed
+    the plain id first - the suffix must still be non-empty or the two collide again.
+    """
+    bare = str(label).lstrip(".")
+    if bare.endswith("()"):
+        bare = bare[:-2]
+    lead = len(bare) - len(bare.lstrip("_"))
+    trail = len(bare) - len(bare.rstrip("_"))
+    return f"u{lead}_{trail}" if (lead or trail) else "n"
+
+
+def _py_module_key(source_file: str) -> str:
+    """A .py path reduced to its importable module path (``a/b/mod.py`` -> ``a/b/mod``,
+    ``a/b/__init__.py`` -> ``a/b``), so an import's slash-path can match it by suffix."""
+    key = str(source_file).replace("\\", "/")
+    if key.endswith("/__init__.py"):
+        return key[: -len("/__init__.py")]
+    if key == "__init__.py":
+        return ""
+    return key[:-3] if key.endswith(".py") else key
+
+
 def _resolve_python_module_path(module_name: str, current_path: Path, root: Path, level: int) -> Path | None:
     if level > 0:
         base = current_path.parent
@@ -10493,9 +10781,17 @@ def _resolve_swift_member_calls(
     # len != 1 is the god-node guard: an ambiguous type name bails.
     type_def_nids: dict[str, list[str]] = {}
     node_by_id: dict[str, dict] = {}
+    # Name-keyed indexes must not span languages: this pass sees EVERY language's nodes, so an
+    # unscoped type name would let a Swift call bind to a same-named Kotlin/TS type.
+    swift_ids = lang_scoped_ids(all_nodes, _SWIFT_SUFFIXES)
     for n in all_nodes:
         node_by_id[n.get("id")] = n
-        if n.get("source_file") and n.get("id") in contained and _is_type_like_definition(n):
+        if (
+            n.get("source_file")
+            and n.get("id") in contained
+            and str(n.get("id")) in swift_ids
+            and _is_type_like_definition(n)
+        ):
             type_def_nids.setdefault(_key(n.get("label", "")), []).append(n["id"])
 
     # (type_node_id, method_key) -> method_node_id, from `method` edges.
@@ -10508,9 +10804,7 @@ def _resolve_swift_member_calls(
         if tnode is not None:
             method_index[(src, _key(tnode.get("label", "")))] = tgt
 
-    all_raw_calls: list[dict] = []
-    for result in per_file:
-        all_raw_calls.extend(result.get("raw_calls", []))
+    all_raw_calls = lang_raw_calls(per_file, _SWIFT_SUFFIXES)
 
     existing_pairs = {(e.get("source"), e.get("target")) for e in all_edges}
     for rc in all_raw_calls:
@@ -10600,12 +10894,21 @@ def _resolve_python_member_calls(
     class_def_nids: dict[str, list[str]] = {}
     method_index: dict[tuple[str, str], str] = {}
     owner_class_of: dict[str, str] = {}
+    # LANGUAGE SCOPING, load-bearing: run_language_resolvers gates only ACTIVATION (this pass runs
+    # when the corpus contains any .py) and then hands over the ENTIRE node/edge set - TypeScript,
+    # C#, Java and all. A name-keyed index built from that would let a Python `obj.render()` bind to
+    # a TypeScript class's `render()`, silently, across languages. Every name-keyed lookup below is
+    # therefore restricted to symbols DEFINED IN .py files.
+    def _is_py(nid: str | None) -> bool:
+        node = node_by_id.get(nid or "")
+        return bool(node) and str(node.get("source_file", "")).endswith(".py")
+
     for e in all_edges:
         if e.get("relation") != "method":
             continue
         src, tgt = e.get("source"), e.get("target")
         cnode = node_by_id.get(src)
-        if cnode is not None:
+        if cnode is not None and _is_py(src):
             class_def_nids.setdefault(_key(cnode.get("label", "")), []).append(src)
         tnode = node_by_id.get(tgt)
         if tnode is not None:
@@ -10613,13 +10916,14 @@ def _resolve_python_member_calls(
         owner_class_of.setdefault(tgt, src)
     # A method-less class (`class Repo(Base): pass`) owns no `method` edge and
     # so is absent above; also index both ends of `inherits` so it still
-    # resolves as a receiver type for base-class method/field lookup.
+    # resolves as a receiver type for base-class method/field lookup. Same .py
+    # restriction as above - a name-keyed class index must not span languages.
     for e in all_edges:
         if e.get("relation") != "inherits":
             continue
         for nid in (e.get("source"), e.get("target")):
             cnode = node_by_id.get(nid)
-            if cnode is not None:
+            if cnode is not None and _is_py(nid):
                 class_def_nids.setdefault(_key(cnode.get("label", "")), []).append(nid)
     if not class_def_nids:
         return
@@ -10688,9 +10992,7 @@ def _resolve_python_member_calls(
                 return r
         return None
 
-    all_raw_calls: list[dict] = []
-    for result in per_file:
-        all_raw_calls.extend(result.get("raw_calls", []))
+    all_raw_calls = lang_raw_calls(per_file, _PY_SUFFIXES)
 
     existing_pairs = {(e.get("source"), e.get("target")) for e in all_edges}
 
@@ -10745,6 +11047,15 @@ def _resolve_python_member_calls(
         # never collides with a same-spelled class via the case-folding key.
         receiver = rc.get("receiver")
         if not receiver or not receiver[:1].isupper():
+            # UNTYPED receiver (`obj.method()` on an unannotated local/parameter). Python
+            # deliberately emits NOTHING here, unlike C++/JS which fall back to a corpus-unique
+            # method name at INFERRED 0.6. That is a POLICY choice, not a missing feature: it is
+            # asserted by test_python_instance_member_call_not_overconnected (#543/#1219/#1446),
+            # and it is why ~24% of Python call sites have no edge. Enabling the fallback here
+            # recovers ~734 links on aethergraph's own cli+api but every one of them is a GUESS
+            # that can be wrong (a duck-typed or library receiver that merely shares a method
+            # name), so it trades missing edges for wrong ones. Do not flip it without an explicit
+            # decision - see Decision_PythonUntypedReceiverEmitsNoEdge.
             continue
         cls_nid = resolve_class(receiver)
         if not cls_nid:
@@ -10753,6 +11064,117 @@ def _resolve_python_member_calls(
         # static reference (unlike a bare instance member call), and the class
         # resolved to exactly one definition that owns the method.
         _emit(caller, lookup_method(cls_nid, mk), "EXTRACTED", 1.0, rc)
+
+
+def _resolve_python_module_calls(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Resolve cross-file Python MODULE-qualified calls (``pushv2.flag_nodes()``).
+
+    ``from pkg import mod`` + ``mod.func()`` is the dominant Python call style, yet
+    it produced NO call edge at all: the in-file pass cannot find the callee (it
+    lives in another file) and _resolve_python_member_calls only ever resolves a
+    receiver that names a CLASS, so a lowercase module receiver was dropped
+    outright. Callers/callees, impact slices and read-hint targeting were all
+    silently under-reporting every such call.
+
+    Resolution here is exact rather than inferred: the file's own import table
+    binds the receiver to one module, and the callee name is looked up only among
+    that module's own module-level definitions. Guards, each of which bails rather
+    than guess: the import must resolve to exactly one module file in the corpus,
+    the name must be defined exactly once there, and class-owned methods are
+    excluded (``mod.method()`` can never name one).
+
+    Must run after id-disambiguation so node ids and caller_nids are final.
+    """
+    aliases_by_file: dict[str, dict[str, str]] = {}
+    for result in per_file:
+        ma = result.get("python_module_aliases")
+        if ma and ma.get("path"):
+            aliases_by_file[ma["path"]] = ma.get("table", {})
+    if not aliases_by_file:
+        return
+
+    # Only module-level definitions are reachable by `mod.name()`. Excluding every
+    # target of a `method` edge keeps a class's method from shadowing a same-named
+    # module function in the same file.
+    method_targets = {e.get("target") for e in all_edges if e.get("relation") == "method"}
+    defs_by_module: dict[str, dict[str, list[str]]] = {}
+    for n in all_nodes:
+        nid, sf, label = n.get("id"), n.get("source_file"), n.get("label")
+        if not nid or not sf or not label or nid in method_targets:
+            continue
+        if not str(sf).endswith(".py"):
+            continue
+        # A node label is decorated (`func()`, `.method()`); a raw call's callee is the
+        # bare name, so index by the undecorated form.
+        bare = str(label).lstrip(".")
+        if bare.endswith("()"):
+            bare = bare[:-2]
+        if not bare:
+            continue
+        defs_by_module.setdefault(_py_module_key(sf), {}).setdefault(bare, []).append(nid)
+    if not defs_by_module:
+        return
+
+    # Bucket by last path segment so suffix matching stays O(candidates), not O(corpus).
+    by_last: dict[str, list[str]] = {}
+    for k in defs_by_module:
+        by_last.setdefault(k.rsplit("/", 1)[-1], []).append(k)
+
+    module_cache: dict[str, str | None] = {}
+
+    def resolve_module(mod_path: str) -> str | None:
+        """The one corpus module whose path ends with this import path, else None."""
+        if mod_path not in module_cache:
+            if mod_path in defs_by_module:
+                module_cache[mod_path] = mod_path
+            else:
+                cands = by_last.get(mod_path.rsplit("/", 1)[-1], [])
+                suffix = "/" + mod_path
+                hits = [k for k in cands if k.endswith(suffix)]
+                module_cache[mod_path] = hits[0] if len(hits) == 1 else None
+        return module_cache[mod_path]
+
+    existing_pairs = {(e.get("source"), e.get("target")) for e in all_edges}
+    for result in per_file:
+        for rc in result.get("raw_calls", []):
+            if not rc.get("is_member_call"):
+                continue
+            receiver, callee, caller = rc.get("receiver"), rc.get("callee"), rc.get("caller_nid")
+            if not receiver or not callee or not caller:
+                continue
+            table = aliases_by_file.get(rc.get("source_file", ""))
+            if not table:
+                continue
+            mod_path = table.get(receiver)
+            if not mod_path:
+                continue
+            mod_key = resolve_module(mod_path)
+            if mod_key is None:
+                continue
+            targets = defs_by_module.get(mod_key, {}).get(callee, [])
+            if len(targets) != 1:
+                continue
+            target = targets[0]
+            if target == caller or (caller, target) in existing_pairs:
+                continue
+            existing_pairs.add((caller, target))
+            all_edges.append({
+                "source": caller,
+                "target": target,
+                "relation": "calls",
+                "context": "call",
+                # An explicit import binding plus an explicit qualified name is as
+                # certain as a bare same-file call, so EXTRACTED (not INFERRED).
+                "confidence": "EXTRACTED",
+                "confidence_score": 1.0,
+                "source_file": rc.get("source_file", ""),
+                "source_location": rc.get("source_location"),
+                "weight": 1.0,
+            })
 
 
 def _resolve_js_member_calls(
@@ -10784,6 +11206,9 @@ def _resolve_js_member_calls(
         return re.sub(r"[^a-zA-Z0-9]+", "", str(label)).lower()
 
     node_by_id: dict[str, dict] = {n.get("id"): n for n in all_nodes}
+    # This pass sees EVERY language's nodes, so a name-keyed class index must be scoped or a JS
+    # `Widget.render()` binds to a same-named Python/C# class.
+    js_ids = lang_scoped_ids(all_nodes, _JS_SUFFIXES)
 
     class_def_nids: dict[str, list[str]] = {}
     method_index: dict[tuple[str, str], str] = {}
@@ -10793,7 +11218,7 @@ def _resolve_js_member_calls(
             continue
         src, tgt = e.get("source"), e.get("target")
         cnode = node_by_id.get(src)
-        if cnode is not None:
+        if cnode is not None and str(src) in js_ids:
             class_def_nids.setdefault(_key(cnode.get("label", "")), []).append(src)
         tnode = node_by_id.get(tgt)
         if tnode is not None:
@@ -10807,7 +11232,7 @@ def _resolve_js_member_calls(
             continue
         for nid in (e.get("source"), e.get("target")):
             cnode = node_by_id.get(nid)
-            if cnode is not None:
+            if cnode is not None and str(nid) in js_ids:
                 class_def_nids.setdefault(_key(cnode.get("label", "")), []).append(nid)
     if not class_def_nids:
         return
@@ -10875,9 +11300,7 @@ def _resolve_js_member_calls(
                 return r
         return None
 
-    all_raw_calls: list[dict] = []
-    for result in per_file:
-        all_raw_calls.extend(result.get("raw_calls", []))
+    all_raw_calls = lang_raw_calls(per_file, _JS_SUFFIXES)
 
     existing_pairs = {(e.get("source"), e.get("target")) for e in all_edges}
 
@@ -10975,9 +11398,18 @@ def _resolve_cpp_calls(
 
     # Class label -> [class node ids]. Real, source-backed, contained, type-like
     # only; len != 1 is the god-node guard (an ambiguous class name bails).
+    # This pass sees EVERY language's nodes, so both name-keyed indexes below are scoped to C/C++
+    # translation units - otherwise a C++ `Widget::render()` can bind to a same-named C# type, and
+    # the unknown-receiver fallback (which keys on method NAME alone) is even more exposed.
+    cpp_ids = lang_scoped_ids(all_nodes, _CPP_SUFFIXES)
     type_def_nids: dict[str, list[str]] = {}
     for n in all_nodes:
-        if n.get("source_file") and n.get("id") in contained and _is_type_like_definition(n):
+        if (
+            n.get("source_file")
+            and n.get("id") in contained
+            and str(n.get("id")) in cpp_ids
+            and _is_type_like_definition(n)
+        ):
             type_def_nids.setdefault(_key(n.get("label", "")), []).append(n["id"])
 
     def resolve_class(name: str | None) -> str | None:
@@ -11041,7 +11473,10 @@ def _resolve_cpp_calls(
         mk = _method_key(tnode.get("label", ""))
         method_index[(src, mk)] = tgt
         owner_class_of.setdefault(tgt, src)
-        methods_by_key.setdefault(mk, []).append(tgt)
+        # methods_by_key drives the unknown-receiver fallback, which matches on method NAME with
+        # no class at all - it MUST stay inside the language or it will reach across one.
+        if str(tgt) in cpp_ids:
+            methods_by_key.setdefault(mk, []).append(tgt)
     for k in list(methods_by_key):
         methods_by_key[k] = sorted(set(methods_by_key[k]))
 
@@ -11103,9 +11538,7 @@ def _resolve_cpp_calls(
         if tt and tt.get("path"):
             type_table_by_file[tt["path"]] = tt.get("table", {})
 
-    all_raw_calls: list[dict] = []
-    for result in per_file:
-        all_raw_calls.extend(result.get("raw_calls", []))
+    all_raw_calls = lang_raw_calls(per_file, _CPP_SUFFIXES)
 
     for rc in all_raw_calls:
         if not rc.get("is_member_call"):
@@ -11178,10 +11611,16 @@ def _resolve_cpp_calls(
 # by adding one register() call below, no edits to extract()'s body. Order
 # preserved from the prior inlined wiring: Swift (#1356) before Python (#1446).
 register_language_resolver(
-    LanguageResolver("swift_member_calls", frozenset({".swift"}), _resolve_swift_member_calls)
+    LanguageResolver("swift_member_calls", _SWIFT_SUFFIXES, _resolve_swift_member_calls)
 )
 register_language_resolver(
-    LanguageResolver("python_member_calls", frozenset({".py"}), _resolve_python_member_calls)
+    LanguageResolver("python_member_calls", _PY_SUFFIXES, _resolve_python_member_calls)
+)
+# Module-qualified calls (`mod.func()` after `from pkg import mod`). Runs AFTER the
+# class-receiver resolver so a receiver that is genuinely a class keeps that path's
+# result; both dedupe against edges already emitted.
+register_language_resolver(
+    LanguageResolver("python_module_calls", _PY_SUFFIXES, _resolve_python_module_calls)
 )
 # JS/TS type-aware member-call resolution (new Thing() / this.<field> / typed
 # param / typed local var / qualified Helper.method()). Suffix set matches
@@ -11189,21 +11628,21 @@ register_language_resolver(
 register_language_resolver(
     LanguageResolver(
         "js_member_calls",
-        frozenset({".js", ".jsx", ".mjs", ".ts", ".tsx"}),
+        _JS_SUFFIXES,
         _resolve_js_member_calls,
     )
 )
 # Ruby type-aware member-call resolution (Class.new + typed var.method). Lives in
 # graphify.ruby_resolution; registered here as a second consumer of the framework.
 register_language_resolver(
-    LanguageResolver("ruby_member_calls", frozenset({".rb"}), resolve_ruby_member_calls)
+    LanguageResolver("ruby_member_calls", _RUBY_SUFFIXES, resolve_ruby_member_calls)
 )
 # C++ out-of-line method linking + member-call resolution. `.h` is included because
 # C++/UE headers route to extract_cpp via the content sniff in _get_extractor.
 register_language_resolver(
     LanguageResolver(
         "cpp_member_calls",
-        frozenset({".cpp", ".cc", ".cxx", ".hpp", ".cu", ".cuh", ".metal", ".h"}),
+        _CPP_SUFFIXES,
         _resolve_cpp_calls,
     )
 )
@@ -11240,7 +11679,9 @@ def extract_objc(path: Path) -> dict:
     seen_ids: set[str] = set()
     method_bodies: list[tuple[str, Any]] = []
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({"id": nid, "label": label, "file_type": "code",
@@ -11603,7 +12044,9 @@ def extract_markdown(path: Path) -> dict:
     edges: list[dict] = []
     seen_ids: set[str] = set()
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int, file_type: str = "document") -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({"id": nid, "label": label, "file_type": file_type,
@@ -12112,7 +12555,9 @@ def extract_pascal(path: Path) -> dict:
     def _read(node) -> str:  # type: ignore[no-untyped-def]
         return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({
@@ -12332,7 +12777,9 @@ def extract_lazarus_form(path: Path) -> dict:
     seen_ids: set[str] = set()
     seen_edge_pairs: set[tuple[str, str, str]] = set()
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({
@@ -12432,7 +12879,9 @@ def extract_delphi_form(path: Path) -> dict:
     seen_ids: set[str] = set()
     seen_edge_pairs: set[tuple[str, str, str]] = set()
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({
@@ -12551,7 +13000,9 @@ def extract_lazarus_package(path: Path) -> dict:
     edges: list[dict] = []
     seen_ids: set[str] = set()
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({
@@ -12649,7 +13100,9 @@ def extract_bash(path: Path) -> dict:
 
     from graphify.security import sanitize_metadata  # module-level cached import
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int, kind: str = "code") -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid and nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({"id": nid, "label": label, "file_type": "code",
@@ -13537,6 +13990,7 @@ def extract_xaml(path: Path) -> dict:
                     return idx
         return 1
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(
         nid: str,
         label: str,
@@ -13545,6 +13999,7 @@ def extract_xaml(path: Path) -> dict:
         file_type: str = "code",
         source_file: str = str_path,
     ) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid in seen_ids:
             return
         seen_ids.add(nid)
@@ -13818,7 +14273,9 @@ def extract_json(path: Path) -> dict:
         "optionalDependencies", "bundleDependencies", "bundledDependencies",
     })
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid and nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({"id": nid, "label": label, "file_type": "code",
@@ -13961,7 +14418,9 @@ def extract_dm(path: Path) -> dict:
     seen_ids: set[str] = set()
     function_bodies: list[tuple[str, Any, "str | None"]] = []
 
+    _claimed_nids: dict[str, str] = {}
     def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
         if nid and nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({"id": nid, "label": label, "file_type": "code",
@@ -15381,6 +15840,8 @@ def extract(
     # a new language plugs in without editing this body (#1356 Swift, #1446 Python).
     run_language_resolvers(paths, per_file, all_nodes, all_edges)
 
+    unresolved_calls = _summarize_unresolved_calls(per_file, all_edges, all_nodes)
+
     # Relativize source_file fields so paths are portable across machines (#555)
     for item in all_nodes + all_edges:
         sf = item.get("source_file")
@@ -15445,6 +15906,7 @@ def extract(
     return {
         "nodes": all_nodes,
         "edges": all_edges,
+        "unresolved_calls": unresolved_calls,
         "input_tokens": 0,
         "output_tokens": 0,
     }
