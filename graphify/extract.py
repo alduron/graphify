@@ -9968,6 +9968,48 @@ def _python_collect_module_aliases(root_node, source: bytes, str_path: str) -> d
     return aliases
 
 
+def _summarize_unresolved_calls(per_file: list[dict], all_edges: list[dict]) -> dict:
+    """Count call sites that produced NO edge, bucketed by file extension.
+
+    This is the missing feedback loop behind a whole bug class. Call resolution is a
+    chain of per-shape resolvers, and a call shape that no resolver claims yields
+    SILENCE - no edge, no error, no warning. Two real defects hid in that silence
+    for months: Python module-qualified calls (`mod.func()`, no resolver at all) and
+    underscore-padded sibling symbols (dropped at node creation). Both were found by
+    a human noticing a wrong answer, which is not a detection strategy.
+
+    Reporting the count per language turns "callers looks empty" into a number that
+    can be watched, compared across runs, and regression-gated. Cheap: one pass over
+    raw_calls, no extra parsing. `unresolved_ratio` is the headline - a language
+    whose ratio jumps has almost certainly grown a call shape nothing claims.
+    """
+    # Exact per-callsite attribution: every call edge carries the source_location of
+    # the call site that produced it, so (caller, location) identifies the site. A
+    # caller-level check would count a function that only calls stdlib as "unresolved"
+    # and drown the signal in noise.
+    resolved_sites = {
+        (e.get("source"), e.get("source_location"))
+        for e in all_edges
+        if e.get("relation") == "calls"
+    }
+    by_ext: dict[str, dict[str, int]] = {}
+    for result in per_file:
+        for rc in result.get("raw_calls", []):
+            source_file = str(rc.get("source_file", ""))
+            ext = Path(source_file).suffix.lower() or "<none>"
+            bucket = by_ext.setdefault(ext, {"total": 0, "unresolved": 0, "member": 0})
+            bucket["total"] += 1
+            if (rc.get("caller_nid"), rc.get("source_location")) not in resolved_sites:
+                bucket["unresolved"] += 1
+                if rc.get("is_member_call"):
+                    bucket["member"] += 1
+    for bucket in by_ext.values():
+        bucket["unresolved_ratio"] = (
+            round(bucket["unresolved"] / bucket["total"], 4) if bucket["total"] else 0.0
+        )
+    return by_ext
+
+
 def _underscore_discriminator(label: str) -> str:
     """A stable id suffix for a symbol whose name collides with a sibling that
     differs only by underscore padding (``_render`` vs ``render``).
@@ -15628,6 +15670,8 @@ def extract(
     # a new language plugs in without editing this body (#1356 Swift, #1446 Python).
     run_language_resolvers(paths, per_file, all_nodes, all_edges)
 
+    unresolved_calls = _summarize_unresolved_calls(per_file, all_edges)
+
     # Relativize source_file fields so paths are portable across machines (#555)
     for item in all_nodes + all_edges:
         sf = item.get("source_file")
@@ -15692,6 +15736,7 @@ def extract(
     return {
         "nodes": all_nodes,
         "edges": all_edges,
+        "unresolved_calls": unresolved_calls,
         "input_tokens": 0,
         "output_tokens": 0,
     }
