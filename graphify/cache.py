@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import atexit
+import functools
 import hashlib
 import json
 import os
@@ -93,6 +94,48 @@ _stat_index: dict[str, dict] = {}
 _stat_index_root: Path | None = None
 _stat_index_dirty: bool = False
 
+# Modules whose source determines what an extraction PRODUCES. Their content is folded into every
+# cache key so an extractor change self-invalidates the cache.
+_EXTRACTOR_MODULES = ("extract.py", "ids.py", "ruby_resolution.py", "resolver_registry.py")
+
+
+@functools.lru_cache(maxsize=1)
+def extractor_fingerprint() -> str:
+    """A digest of the EXTRACTOR ITSELF, mixed into every per-file cache key.
+
+    Without this, the cache is keyed on file content alone, so an unchanged file replays a cached
+    result produced by the OLD extractor - and every extraction improvement is silently inert for
+    every existing install until someone deletes the cache by hand. Measured on aethergraph: three
+    consecutive `sync --full` runs returned byte-identical counts after an extractor fix shipped;
+    deleting the cache recovered +990 edges immediately
+    (Caveat_GraphifyPerFileCacheMakesExtractorFixesInert).
+
+    Deliberately a hash of the module SOURCE rather than a hand-maintained schema constant: a
+    constant has to be remembered on every extraction change, and this whole failure mode is what
+    forgetting looks like. Hashing the source cannot be forgotten.
+
+    Falls back to the package version when the source is unreadable (a frozen/zipped install), which
+    is weaker but never wrong-in-the-unsafe-direction: a stale cache there is no worse than today.
+    """
+    digests: list[str] = []
+    try:
+        pkg_dir = Path(__file__).resolve().parent
+        for name in _EXTRACTOR_MODULES:
+            try:
+                digests.append(hashlib.sha256((pkg_dir / name).read_bytes()).hexdigest())
+            except OSError:
+                continue
+    except Exception:  # never let fingerprinting break an extraction
+        digests = []
+    if not digests:
+        try:
+            from graphify import __version__ as _v
+
+            digests = [str(_v)]
+        except Exception:
+            digests = ["unknown"]
+    return hashlib.sha256("|".join(digests).encode()).hexdigest()[:16]
+
 
 def _stat_index_file(root: Path) -> Path:
     _out = Path(_GRAPHIFY_OUT)
@@ -108,11 +151,19 @@ def _ensure_stat_index(root: Path) -> None:
     p = _stat_index_file(_stat_index_root)
     if p.exists():
         try:
-            _stat_index = json.loads(p.read_text(encoding="utf-8"))
+            loaded = json.loads(p.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
-            _stat_index = {}
+            loaded = {}
+        # The stat index maps (size, mtime_ns) -> a PREVIOUSLY COMPUTED hash, so it would hand back
+        # pre-fingerprint keys and defeat the invalidation above. Drop it wholesale when the
+        # extractor changed.
+        if isinstance(loaded, dict) and loaded.get("_fingerprint") == extractor_fingerprint():
+            _stat_index = loaded
+        else:
+            _stat_index = {"_fingerprint": extractor_fingerprint()}
+            _stat_index_dirty = True
     else:
-        _stat_index = {}
+        _stat_index = {"_fingerprint": extractor_fingerprint()}
     atexit.register(_flush_stat_index)
 
 
@@ -189,6 +240,10 @@ def file_hash(path: Path, root: Path = Path(".")) -> str:
     raw = p.read_bytes()
     content = _body_content(raw) if p.suffix.lower() == ".md" else raw
     h = hashlib.sha256()
+    # The extractor's own source is part of the key: identical file content extracted by a DIFFERENT
+    # extractor is a different result, and replaying the old one is what made extraction fixes inert.
+    h.update(extractor_fingerprint().encode())
+    h.update(b"\x00")
     h.update(content)
     h.update(b"\x00")
     try:

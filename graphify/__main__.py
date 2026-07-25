@@ -3567,6 +3567,19 @@ def main() -> None:
                 print(f"Done - {len(communities)} communities. GRAPH_REPORT.md and graph.json updated.")
 
     elif cmd == "update":
+
+        def _set_max_workers(raw: str) -> None:
+            """Apply --max-workers via the env var the extract path already reads.
+
+            `extract` has its own nested _parse_int, which is out of scope here; a bad value is a
+            no-op rather than a hard exit, because failing the whole incremental rebuild over a
+            malformed worker count is exactly the disproportionate failure this flag caused before.
+            """
+            try:
+                os.environ["GRAPHIFY_MAX_WORKERS"] = str(int(raw))
+            except ValueError:
+                print(f"warning: ignoring non-integer --max-workers {raw!r}", file=sys.stderr)
+
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
         no_cluster = False
         files_arg: str | None = None
@@ -3596,11 +3609,21 @@ def main() -> None:
                 cli_excludes.append(args[i + 1]); i += 2
             elif a.startswith("--exclude="):
                 cli_excludes.append(a.split("=", 1)[1]); i += 1
+            # --max-workers mirrors `extract --max-workers`. The aethergraph CLI passes the SAME
+            # argv to update as to extract, and rejecting it here made EVERY incremental sync exit 2
+            # at arg parsing and silently degrade to a full extract - the identical failure --exclude
+            # had (Caveat_SyncPassesMaxWorkersGraphifyUpdateRejects). Applied via the env var the
+            # extract path already reads, so both verbs honour it the same way.
+            elif a == "--max-workers" and i + 1 < len(args):
+                _set_max_workers(args[i + 1]); i += 2
+            elif a.startswith("--max-workers="):
+                _set_max_workers(a.split("=", 1)[1]); i += 1
             elif a.startswith("-"):
                 print(
                     "error: unknown update option: " + a + "\n"
                     "Usage: graphify update [path] [--force] [--no-cluster] "
-                    "[--files <changelist-file>] [--out <dir>] [--exclude <pattern>]",
+                    "[--files <changelist-file>] [--out <dir>] [--exclude <pattern>] "
+                    "[--max-workers N]",
                     file=sys.stderr,
                 )
                 sys.exit(2)
