@@ -2911,6 +2911,90 @@ def _python_param_types(params_node, source: bytes) -> dict[str, str]:
     return out
 
 
+def _python_collect_return_types(root_node, source: bytes) -> dict[str, str]:
+    """``function_name -> annotated return TYPE NAME`` for every def in this file.
+
+    Half of return-type propagation: `x = build_repo()` types `x` exactly when `build_repo` is
+    declared `-> Repo`. An annotation is a DECLARATION, not an inference, so consuming it keeps the
+    no-guessing rule intact.
+
+    Only single class-like names are kept - `-> Repo`, not `-> list[Repo]`, `-> Repo | None` or
+    `-> None` - because only those name one class to resolve a member call against. A name declared
+    twice with DIFFERENT return types maps to None and is skipped downstream, mirroring the
+    single-binding contract _python_local_var_types already uses.
+    """
+    out: dict[str, str | None] = {}
+    for node in _walk_python_tree(root_node):
+        if node.type != "function_definition":
+            continue
+        name_node = node.child_by_field_name("name")
+        ret_node = node.child_by_field_name("return_type")
+        if name_node is None or ret_node is None:
+            continue
+        cls = _python_single_type_ref(ret_node, source)
+        if not cls:
+            continue
+        name = _read_text(name_node, source)
+        if name in out and out[name] != cls:
+            out[name] = None  # ambiguous across overloads/redefinitions: refuse rather than guess
+        else:
+            out.setdefault(name, cls)
+    return {k: v for k, v in out.items() if v}
+
+
+def _python_collect_call_bindings(
+    body_node, source: bytes, known: dict[str, str | None]
+) -> dict[str, str]:
+    """``local_var -> called FUNCTION NAME`` for ``x = f()`` / ``x = self.f()`` in one function body.
+
+    The other half of return-type propagation. The callee's return type is usually declared in
+    ANOTHER file, so the type cannot be resolved here; record which function produced the value and
+    let the cross-file pass join it against the corpus-wide return-type index.
+
+    ``known`` is the already-typed binding map: a var typed by an annotation or a direct
+    constructor call is left alone, so this only fills genuinely untyped slots. A var bound more
+    than once is dropped, matching the single-binding contract used elsewhere.
+    """
+    bindings: dict[str, str | None] = {}
+    boundary = {"function_definition", "lambda"}
+
+    def visit(n) -> None:
+        for child in n.children:
+            if child.type in boundary:
+                continue
+            if child.type == "assignment":
+                left = child.child_by_field_name("left")
+                right = child.child_by_field_name("right")
+                if (
+                    left is not None
+                    and left.type == "identifier"
+                    and right is not None
+                    and right.type == "call"
+                ):
+                    var = _read_text(left, source)
+                    if not known.get(var):
+                        fn = right.child_by_field_name("function")
+                        callee: str | None = None
+                        if fn is not None and fn.type == "identifier":
+                            callee = _read_text(fn, source)
+                        elif fn is not None and fn.type == "attribute":
+                            attr = fn.child_by_field_name("attribute")
+                            if attr is not None:
+                                callee = _read_text(attr, source)
+                        if callee:
+                            bindings[var] = None if var in bindings else callee
+            visit(child)
+
+    visit(body_node)
+    return {k: v for k, v in bindings.items() if v}
+
+
+def _python_is_super_call(node, source: bytes) -> bool:
+    """True for the `super()` receiver of a `super().method()` call (bare, no explicit args form)."""
+    fn = node.child_by_field_name("function")
+    return fn is not None and fn.type == "identifier" and _read_text(fn, source) == "super"
+
+
 def _python_local_var_types(
     body_node, source: bytes, param_types: dict[str, str]
 ) -> dict[str, str | None]:
@@ -4604,6 +4688,10 @@ def _extract_generic(
     # / self_field for cross-file resolution in _resolve_python_member_calls.
     python_var_types: dict[str, dict[str, str | None]] = {}
     python_field_types: dict[str, dict[str, str]] = {}
+    # Return-type propagation (both halves are per-file; the JOIN is corpus-wide, in the resolver):
+    # caller_nid -> {local_var: callee_function_name}, and function_name -> declared return type.
+    python_call_bindings: dict[str, dict[str, str]] = {}
+    python_return_types: dict[str, str] = {}
     # Python: local name -> imported MODULE slash-path, populated before walk_calls
     # runs. A `module.func()` receiver is a module, not a class, so it resolves in
     # _resolve_python_module_calls; walk_calls only needs it to know NOT to bind
@@ -4821,6 +4909,14 @@ def _extract_generic(
                                 # receiver so cross-file resolution can look up
                                 # the field's type on the caller's own class.
                                 self_field = _python_self_target(obj, source)
+                            elif (obj is not None and obj.type == "call"
+                                  and config.ts_module == "tree_sitter_python"
+                                  and _python_is_super_call(obj, source)):
+                                # `super().method()`: the receiver is a call, not a name, so it was
+                                # captured as nothing at all and the edge was dropped. The target is
+                                # EXACT - the caller's own base classes - so mark it and let the
+                                # cross-file pass walk the MRO from the caller's class.
+                                member_receiver = "super"
                             elif (obj is not None and obj.type == "member_expression"
                                   and config.ts_module in (
                                       "tree_sitter_javascript", "tree_sitter_typescript")):
@@ -4850,9 +4946,14 @@ def _extract_generic(
                 # callee lives in the IMPORTED MODULE, so an in-file bare-name lookup
                 # would silently bind it to a same-named local def. Resolved for real
                 # in _resolve_python_module_calls.
+                # `super().method()` must defer too, and it is the subtlest of the four: the
+                # OVERRIDING method usually has the SAME name, so an in-file bare-name lookup finds
+                # the caller itself, hits the tgt_nid == caller_nid drop, and the call vanishes
+                # without ever reaching the cross-file pass that knows to start at the bases.
                 if is_member_call and (
                     (member_receiver and member_receiver[:1].isupper())
                     or self_field
+                    or member_receiver == "super"
                     or (member_receiver and member_receiver in python_module_aliases)
                 ):
                     tgt_nid = None
@@ -5051,8 +5152,14 @@ def _extract_generic(
         for caller_nid, body_node in function_bodies:
             param_types = _python_param_types(python_func_params.get(caller_nid), source)
             python_var_types[caller_nid] = _python_local_var_types(body_node, source, param_types)
+            # Return-type propagation: record which FUNCTION produced each otherwise-untyped local,
+            # so the cross-file pass can type it from that function's declared return annotation.
+            python_call_bindings[caller_nid] = _python_collect_call_bindings(
+                body_node, source, python_var_types[caller_nid]
+            )
         python_field_types = _python_collect_self_field_types(root, source)
         python_module_aliases = _python_collect_module_aliases(root, source, str_path)
+        python_return_types = _python_collect_return_types(root, source)
 
     if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
         for caller_nid, body_node in function_bodies:
@@ -5112,6 +5219,10 @@ def _extract_generic(
         result["python_field_types"] = {"path": str_path, "table": python_field_types}
     if python_module_aliases:
         result["python_module_aliases"] = {"path": str_path, "table": python_module_aliases}
+    if python_return_types:
+        result["python_return_types"] = {"path": str_path, "table": python_return_types}
+    if python_call_bindings:
+        result["python_call_bindings"] = {"path": str_path, "table": python_call_bindings}
     if js_field_types:
         result["js_field_types"] = {"path": str_path, "table": js_field_types}
     return result
@@ -10942,10 +11053,26 @@ def _resolve_python_member_calls(
     # class body never spans files), so a raw call's own source_file always
     # carries its caller's enclosing class's field table too.
     field_types_by_file: dict[str, dict[str, dict[str, str]]] = {}
+    # Return-type propagation join. return_types is CORPUS-WIDE because the function producing a
+    # value usually lives in another file; a name declared with two different return types across
+    # the corpus is dropped rather than guessed at.
+    return_types: dict[str, str | None] = {}
+    call_bindings: dict[str, dict[str, str]] = {}
     for result in per_file:
         ft = result.get("python_field_types")
         if ft and ft.get("path"):
             field_types_by_file[ft["path"]] = ft.get("table", {})
+        rt = result.get("python_return_types")
+        if rt:
+            for fn_name, type_name in (rt.get("table") or {}).items():
+                if fn_name in return_types and return_types[fn_name] != type_name:
+                    return_types[fn_name] = None
+                else:
+                    return_types.setdefault(fn_name, type_name)
+        cb = result.get("python_call_bindings")
+        if cb:
+            for caller_nid, table in (cb.get("table") or {}).items():
+                call_bindings.setdefault(caller_nid, {}).update(table)
 
     # Base-class map so an inherited method/field resolves up the hierarchy
     # (mirrors _resolve_cpp_calls's bases_of / lookup_method / field_type).
@@ -11060,6 +11187,32 @@ def _resolve_python_member_calls(
             if owner_nid:
                 _emit(caller, lookup_method(owner_nid, mk), "EXTRACTED", 1.0, rc)
             continue
+
+        # `super().method()`: exact for the same reason, but it must skip the caller's OWN class and
+        # start at the bases - resolving to the caller's class would find the overriding method,
+        # i.e. the very method making the call, which is the opposite of what super() means.
+        if receiver == "super":
+            owner_nid = owner_class_of.get(caller)
+            for base in bases_of.get(owner_nid or "", []):
+                target = lookup_method(base, mk)
+                if target:
+                    _emit(caller, target, "EXTRACTED", 1.0, rc)
+                    break
+            continue
+
+        # Return-type propagation: `repo = build_repo()` then `repo.save()`. The var's type is the
+        # DECLARED return annotation of the function that produced it, joined corpus-wide. An
+        # annotation is a declaration, not an inference, so this stays inside the no-guessing rule -
+        # and it is the last exact-resolvable shape (super()/self/cls/qualified/typed-param/
+        # annotated-local being the others). INFERRED 0.8, matching the typed-local path: the
+        # annotation is authoritative, but the binding chain has one more hop than a direct type.
+        if receiver:
+            produced_by = call_bindings.get(caller, {}).get(receiver)
+            declared = return_types.get(produced_by or "")
+            cls_nid = resolve_class(declared) if declared else None
+            if cls_nid:
+                _emit(caller, lookup_method(cls_nid, mk), "INFERRED", 0.8, rc)
+                continue
 
         # Original #1446 path: only a capitalized receiver is treated as a
         # class reference, so an instance/module (`obj`, `config`)
