@@ -10796,12 +10796,21 @@ def _resolve_python_member_calls(
     class_def_nids: dict[str, list[str]] = {}
     method_index: dict[tuple[str, str], str] = {}
     owner_class_of: dict[str, str] = {}
+    # LANGUAGE SCOPING, load-bearing: run_language_resolvers gates only ACTIVATION (this pass runs
+    # when the corpus contains any .py) and then hands over the ENTIRE node/edge set - TypeScript,
+    # C#, Java and all. A name-keyed index built from that would let a Python `obj.render()` bind to
+    # a TypeScript class's `render()`, silently, across languages. Every name-keyed lookup below is
+    # therefore restricted to symbols DEFINED IN .py files.
+    def _is_py(nid: str | None) -> bool:
+        node = node_by_id.get(nid or "")
+        return bool(node) and str(node.get("source_file", "")).endswith(".py")
+
     for e in all_edges:
         if e.get("relation") != "method":
             continue
         src, tgt = e.get("source"), e.get("target")
         cnode = node_by_id.get(src)
-        if cnode is not None:
+        if cnode is not None and _is_py(src):
             class_def_nids.setdefault(_key(cnode.get("label", "")), []).append(src)
         tnode = node_by_id.get(tgt)
         if tnode is not None:
@@ -10809,13 +10818,14 @@ def _resolve_python_member_calls(
         owner_class_of.setdefault(tgt, src)
     # A method-less class (`class Repo(Base): pass`) owns no `method` edge and
     # so is absent above; also index both ends of `inherits` so it still
-    # resolves as a receiver type for base-class method/field lookup.
+    # resolves as a receiver type for base-class method/field lookup. Same .py
+    # restriction as above - a name-keyed class index must not span languages.
     for e in all_edges:
         if e.get("relation") != "inherits":
             continue
         for nid in (e.get("source"), e.get("target")):
             cnode = node_by_id.get(nid)
-            if cnode is not None:
+            if cnode is not None and _is_py(nid):
                 class_def_nids.setdefault(_key(cnode.get("label", "")), []).append(nid)
     if not class_def_nids:
         return
@@ -10941,6 +10951,15 @@ def _resolve_python_member_calls(
         # never collides with a same-spelled class via the case-folding key.
         receiver = rc.get("receiver")
         if not receiver or not receiver[:1].isupper():
+            # UNTYPED receiver (`obj.method()` on an unannotated local/parameter). Python
+            # deliberately emits NOTHING here, unlike C++/JS which fall back to a corpus-unique
+            # method name at INFERRED 0.6. That is a POLICY choice, not a missing feature: it is
+            # asserted by test_python_instance_member_call_not_overconnected (#543/#1219/#1446),
+            # and it is why ~24% of Python call sites have no edge. Enabling the fallback here
+            # recovers ~734 links on aethergraph's own cli+api but every one of them is a GUESS
+            # that can be wrong (a duck-typed or library receiver that merely shares a method
+            # name), so it trades missing edges for wrong ones. Do not flip it without an explicit
+            # decision - see Decision_PythonUntypedReceiverEmitsNoEdge.
             continue
         cls_nid = resolve_class(receiver)
         if not cls_nid:
