@@ -83,3 +83,39 @@ def test_diagnostic_is_bucketed_by_extension(tmp_path: Path):
     assert ".py" in buckets
     assert ".js" in buckets
     assert buckets[".py"]["unresolved"] == 1
+
+
+def test_first_party_separates_a_missing_link_from_an_external_call(tmp_path: Path):
+    """The raw unresolved ratio is uninterpretable on its own - most unresolved calls are always
+    external. `first_party` counts only calls whose target this corpus DEFINES, so every one is a
+    link the graph should have and does not. Its target is zero, so it can be regression-gated."""
+    _write(tmp_path / "pkg/__init__.py", "")
+    _write(tmp_path / "pkg/mod.py", "def homegrown():\n    return 1\n")
+    caller = _write(
+        tmp_path / "pkg/app.py",
+        "import requests\n\n"
+        "def go(thing):\n"
+        "    thing.homegrown()\n"          # target IS defined here -> a missing link
+        "    return requests.get('x')\n",  # external -> legitimately unresolved
+    )
+    callee = tmp_path / "pkg/mod.py"
+
+    result = extract([callee, caller], cache_root=tmp_path / "cache")
+
+    py = result["unresolved_calls"][".py"]
+    assert py["unresolved"] == 2
+    assert py["first_party"] == 1, "only the call whose target exists here counts"
+    assert py["first_party_ratio"] > 0
+
+
+def test_first_party_is_zero_when_everything_resolves(tmp_path: Path):
+    _write(tmp_path / "pkg/__init__.py", "")
+    callee = _write(tmp_path / "pkg/mod.py", "def target():\n    return 1\n")
+    caller = _write(
+        tmp_path / "pkg/app.py",
+        "from pkg import mod\n\ndef go():\n    return mod.target()\n",
+    )
+
+    result = extract([callee, caller], cache_root=tmp_path / "cache")
+
+    assert result["unresolved_calls"][".py"]["first_party"] == 0

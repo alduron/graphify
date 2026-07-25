@@ -9968,7 +9968,9 @@ def _python_collect_module_aliases(root_node, source: bytes, str_path: str) -> d
     return aliases
 
 
-def _summarize_unresolved_calls(per_file: list[dict], all_edges: list[dict]) -> dict:
+def _summarize_unresolved_calls(
+    per_file: list[dict], all_edges: list[dict], all_nodes: list[dict]
+) -> dict:
     """Count call sites that produced NO edge, bucketed by file extension.
 
     This is the missing feedback loop behind a whole bug class. Call resolution is a
@@ -9992,20 +9994,42 @@ def _summarize_unresolved_calls(per_file: list[dict], all_edges: list[dict]) -> 
         for e in all_edges
         if e.get("relation") == "calls"
     }
+    # Undecorated names this corpus actually DEFINES. An unresolved call to one of these is a
+    # missing LINK (the target exists and we failed to reach it); an unresolved call to anything
+    # else is external - stdlib/third-party - and legitimately has no edge. Without this split the
+    # raw ratio is uninterpretable, because most unresolved calls are always going to be external.
+    defined: set[str] = set()
+    for n in all_nodes:
+        label = str(n.get("label") or "").lstrip(".")
+        if label.endswith("()"):
+            label = label[:-2]
+        if label:
+            defined.add(label)
+
     by_ext: dict[str, dict[str, int]] = {}
     for result in per_file:
         for rc in result.get("raw_calls", []):
             source_file = str(rc.get("source_file", ""))
             ext = Path(source_file).suffix.lower() or "<none>"
-            bucket = by_ext.setdefault(ext, {"total": 0, "unresolved": 0, "member": 0})
+            bucket = by_ext.setdefault(
+                ext, {"total": 0, "unresolved": 0, "member": 0, "first_party": 0}
+            )
             bucket["total"] += 1
             if (rc.get("caller_nid"), rc.get("source_location")) not in resolved_sites:
                 bucket["unresolved"] += 1
                 if rc.get("is_member_call"):
                     bucket["member"] += 1
+                if str(rc.get("callee") or "") in defined:
+                    bucket["first_party"] += 1
     for bucket in by_ext.values():
         bucket["unresolved_ratio"] = (
             round(bucket["unresolved"] / bucket["total"], 4) if bucket["total"] else 0.0
+        )
+        # THE number to watch: unresolved calls whose target this corpus defines. Every one of these
+        # is a link the graph should have and does not. Unlike unresolved_ratio it has a meaningful
+        # target - zero - so it can be regression-gated directly.
+        bucket["first_party_ratio"] = (
+            round(bucket["first_party"] / bucket["total"], 4) if bucket["total"] else 0.0
         )
     return by_ext
 
@@ -15670,7 +15694,7 @@ def extract(
     # a new language plugs in without editing this body (#1356 Swift, #1446 Python).
     run_language_resolvers(paths, per_file, all_nodes, all_edges)
 
-    unresolved_calls = _summarize_unresolved_calls(per_file, all_edges)
+    unresolved_calls = _summarize_unresolved_calls(per_file, all_edges, all_nodes)
 
     # Relativize source_file fields so paths are portable across machines (#555)
     for item in all_nodes + all_edges:
