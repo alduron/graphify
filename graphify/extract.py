@@ -549,6 +549,14 @@ class LanguageConfig:
     call_accessor_field: str = "attribute"          # field on accessor for method name
     call_accessor_object_field: str = ""            # field on accessor for the receiver/object
 
+    # The receiver spellings that mean "my own instance/class" and "my base class". Every OO
+    # language has both; only the words differ (self/this/me, super/base/parent). Naming them here
+    # instead of per-language resolvers is what lets ONE shared pass resolve `this.m()` and
+    # `super.m()` for every language on this path - both are EXACT (the class is the caller's own,
+    # named in source), so resolving them never guesses.
+    self_receiver_names: frozenset = frozenset()
+    super_receiver_names: frozenset = frozenset()
+
     # Stop recursion at these types in walk_calls
     function_boundary_types: frozenset = frozenset()
 
@@ -2429,6 +2437,8 @@ def _swift_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: s
 
 _PYTHON_CONFIG = LanguageConfig(
     ts_module="tree_sitter_python",
+    self_receiver_names=frozenset({"self", "cls"}),
+    super_receiver_names=frozenset({"super"}),
     class_types=frozenset({"class_definition"}),
     function_types=frozenset({"function_definition"}),
     import_types=frozenset({"import_statement", "import_from_statement"}),
@@ -2443,6 +2453,8 @@ _PYTHON_CONFIG = LanguageConfig(
 
 _JS_CONFIG = LanguageConfig(
     ts_module="tree_sitter_javascript",
+    self_receiver_names=frozenset({"this"}),
+    super_receiver_names=frozenset({"super"}),
     class_types=frozenset({"class_declaration"}),
     function_types=frozenset({"function_declaration", "method_definition"}),
     import_types=frozenset({"import_statement", "export_statement"}),
@@ -2457,6 +2469,8 @@ _JS_CONFIG = LanguageConfig(
 
 _TS_CONFIG = LanguageConfig(
     ts_module="tree_sitter_typescript",
+    self_receiver_names=frozenset({"this"}),
+    super_receiver_names=frozenset({"super"}),
     ts_language_fn="language_typescript",
     class_types=frozenset({
         "class_declaration",
@@ -2482,6 +2496,8 @@ _TS_CONFIG = LanguageConfig(
 # JSX expressions, dropping any call_expression nested inside JSX (e.g. {fmtDate(x)}).
 _TSX_CONFIG = LanguageConfig(
     ts_module="tree_sitter_typescript",
+    self_receiver_names=frozenset({"this"}),
+    super_receiver_names=frozenset({"super"}),
     ts_language_fn="language_tsx",
     class_types=_TS_CONFIG.class_types,
     function_types=_TS_CONFIG.function_types,
@@ -2497,6 +2513,8 @@ _TSX_CONFIG = LanguageConfig(
 
 _JAVA_CONFIG = LanguageConfig(
     ts_module="tree_sitter_java",
+    self_receiver_names=frozenset({"this"}),
+    super_receiver_names=frozenset({"super"}),
     # record_declaration shares class_declaration's name/body/interfaces fields,
     # so it becomes a first-class type node instead of an isolated file (#1373).
     # Enums and annotation declarations use the same name/body contract.
@@ -2517,6 +2535,8 @@ _JAVA_CONFIG = LanguageConfig(
 
 _GROOVY_CONFIG = LanguageConfig(
     ts_module="tree_sitter_groovy",
+    self_receiver_names=frozenset({"this"}),
+    super_receiver_names=frozenset({"super"}),
     class_types=frozenset({"class_declaration", "interface_declaration"}),
     function_types=frozenset({"method_declaration", "constructor_declaration"}),
     import_types=frozenset({"import_declaration"}),
@@ -2543,6 +2563,8 @@ _C_CONFIG = LanguageConfig(
 
 _CPP_CONFIG = LanguageConfig(
     ts_module="tree_sitter_cpp",
+    self_receiver_names=frozenset({"this"}),
+    super_receiver_names=frozenset(set()),
     # enum_specifier (incl. `enum class`) is a node-producing type so C++ enums
     # get an enum node + case_of enumerator edges, matching other OOP languages.
     class_types=frozenset({"class_specifier", "struct_specifier", "enum_specifier"}),
@@ -2559,6 +2581,8 @@ _CPP_CONFIG = LanguageConfig(
 
 _RUBY_CONFIG = LanguageConfig(
     ts_module="tree_sitter_ruby",
+    self_receiver_names=frozenset({"self"}),
+    super_receiver_names=frozenset({"super"}),
     class_types=frozenset({"class"}),
     function_types=frozenset({"method", "singleton_method"}),
     import_types=frozenset(),
@@ -2572,6 +2596,8 @@ _RUBY_CONFIG = LanguageConfig(
 
 _CSHARP_CONFIG = LanguageConfig(
     ts_module="tree_sitter_c_sharp",
+    self_receiver_names=frozenset({"this"}),
+    super_receiver_names=frozenset({"base"}),
     class_types=frozenset({
         "class_declaration",
         "interface_declaration",
@@ -2585,6 +2611,7 @@ _CSHARP_CONFIG = LanguageConfig(
     call_function_field="function",
     call_accessor_node_types=frozenset({"member_access_expression"}),
     call_accessor_field="name",
+    call_accessor_object_field="expression",
     body_fallback_child_types=("declaration_list",),
     function_boundary_types=frozenset({"method_declaration"}),
     import_handler=_import_csharp,
@@ -2592,6 +2619,8 @@ _CSHARP_CONFIG = LanguageConfig(
 
 _KOTLIN_CONFIG = LanguageConfig(
     ts_module="tree_sitter_kotlin",
+    self_receiver_names=frozenset({"this"}),
+    super_receiver_names=frozenset({"super"}),
     class_types=frozenset({"class_declaration", "object_declaration"}),
     function_types=frozenset({"function_declaration"}),
     import_types=frozenset({"import_header"}),
@@ -2599,6 +2628,7 @@ _KOTLIN_CONFIG = LanguageConfig(
     call_function_field="",
     call_accessor_node_types=frozenset({"navigation_expression"}),
     call_accessor_field="",
+    call_accessor_object_field="expression",
     # Different tree-sitter-kotlin grammar versions name plain identifier
     # nodes differently: PyPI's `tree_sitter_kotlin` uses `identifier`,
     # older forks use `simple_identifier`. Accept both so the extractor
@@ -2611,6 +2641,8 @@ _KOTLIN_CONFIG = LanguageConfig(
 
 _SCALA_CONFIG = LanguageConfig(
     ts_module="tree_sitter_scala",
+    self_receiver_names=frozenset({"this"}),
+    super_receiver_names=frozenset({"super"}),
     class_types=frozenset({"class_definition", "object_definition"}),
     function_types=frozenset({"function_definition"}),
     import_types=frozenset({"import_declaration"}),
@@ -2626,6 +2658,8 @@ _SCALA_CONFIG = LanguageConfig(
 
 _PHP_CONFIG = LanguageConfig(
     ts_module="tree_sitter_php",
+    self_receiver_names=frozenset({"$this", "this"}),
+    super_receiver_names=frozenset({"parent"}),
     ts_language_fn="language_php",
     class_types=frozenset({"class_declaration"}),
     function_types=frozenset({"function_definition", "method_declaration"}),
@@ -2638,6 +2672,7 @@ _PHP_CONFIG = LanguageConfig(
     call_function_field="function",
     call_accessor_node_types=frozenset({"member_call_expression"}),
     call_accessor_field="name",
+    call_accessor_object_field="object",
     name_fallback_child_types=("name",),
     body_fallback_child_types=("declaration_list", "compound_statement"),
     function_boundary_types=frozenset({"function_definition", "method_declaration"}),
@@ -2708,6 +2743,8 @@ def _import_lua(node, source: bytes, file_nid: str, stem: str, edges: list, str_
 
 _LUA_CONFIG = LanguageConfig(
     ts_module="tree_sitter_lua",
+    self_receiver_names=frozenset({"self"}),
+    super_receiver_names=frozenset(set()),
     ts_language_fn="language",
     class_types=frozenset(),
     function_types=frozenset({"function_declaration"}),
@@ -2775,6 +2812,8 @@ def _read_csharp_type_name(node, source: bytes) -> str | None:
 
 _SWIFT_CONFIG = LanguageConfig(
     ts_module="tree_sitter_swift",
+    self_receiver_names=frozenset({"self"}),
+    super_receiver_names=frozenset({"super"}),
     class_types=frozenset({"class_declaration", "protocol_declaration"}),
     function_types=frozenset({"function_declaration", "init_declaration", "deinit_declaration", "subscript_declaration"}),
     import_types=frozenset({"import_declaration"}),
@@ -4902,6 +4941,17 @@ def _extract_generic(
                             obj = func_node.child_by_field_name(config.call_accessor_object_field)
                             if obj is not None and obj.type == "identifier":
                                 member_receiver = _read_text(obj, source)
+                            elif obj is not None and (
+                                config.self_receiver_names or config.super_receiver_names
+                            ) and _read_text(obj, source) in (
+                                config.self_receiver_names | config.super_receiver_names
+                            ):
+                                # `this` / `$this` / `base` / `parent` are NOT `identifier` nodes in
+                                # most grammars (this_expression, variable_name, super, ...), so the
+                                # identifier check above misses them and the receiver was lost.
+                                # Match on TEXT against the language's configured names instead, so
+                                # one rule covers every grammar's spelling of the same concept.
+                                member_receiver = _read_text(obj, source)
                             elif (obj is not None and obj.type == "attribute"
                                   and config.ts_module == "tree_sitter_python"):
                                 # `self.repo.save()`: the object is itself an
@@ -4950,10 +5000,27 @@ def _extract_generic(
                 # OVERRIDING method usually has the SAME name, so an in-file bare-name lookup finds
                 # the caller itself, hits the tgt_nid == caller_nid drop, and the call vanishes
                 # without ever reaching the cross-file pass that knows to start at the bases.
+                # A self/super receiver defers for EVERY language now, not just Python: the
+                # overriding method usually shares the base method's name, so an in-file bare-name
+                # lookup finds the caller itself, hits the tgt_nid == caller_nid drop, and the call
+                # vanishes before the shared self/super pass ever sees it.
+                receiver_kind = ""
+                if member_receiver:
+                    if member_receiver in config.self_receiver_names:
+                        receiver_kind = "self"
+                    elif member_receiver in config.super_receiver_names:
+                        receiver_kind = "super"
+                # ONLY `super` defers, never `self`. Deferring a self-receiver would DISCARD the
+                # in-file edge the bare-name lookup already resolves correctly, and the shared pass
+                # cannot always replace it - a net loss (it silently deleted every TypeScript call
+                # edge when first written this way). A self-call the in-file lookup misses falls
+                # through to raw_calls on its own, which is exactly where the shared pass picks it
+                # up. `super` is different: the same-named override makes the in-file lookup match
+                # the CALLER, hit the tgt_nid == caller_nid drop, and vanish before any pass sees it.
                 if is_member_call and (
                     (member_receiver and member_receiver[:1].isupper())
                     or self_field
-                    or member_receiver == "super"
+                    or receiver_kind == "super"
                     or (member_receiver and member_receiver in python_module_aliases)
                 ):
                     tgt_nid = None
@@ -4983,6 +5050,10 @@ def _extract_generic(
                         "source_file": str_path,
                         "source_location": f"L{node.start_point[0] + 1}",
                         "receiver": swift_receiver or member_receiver or cpp_receiver,
+                        # "self" | "super" | "" - resolved by the shared cross-language pass. Set
+                        # from the LANGUAGE CONFIG, so `this`/`self`/`$this` and `super`/`base`/
+                        # `parent` are one concept rather than a per-language special case.
+                        "receiver_kind": receiver_kind,
                     }
                     # Ruby: attach the receiver's inferred type from the method's
                     # local `var = Const.new` bindings, when unambiguously known.
@@ -11237,6 +11308,97 @@ def _resolve_python_member_calls(
         _emit(caller, lookup_method(cls_nid, mk), "EXTRACTED", 1.0, rc)
 
 
+_SELF_SUPER_SUFFIXES = frozenset({
+    ".py", ".js", ".jsx", ".mjs", ".ts", ".tsx", ".java", ".groovy", ".gradle",
+    ".cpp", ".cc", ".cxx", ".hpp", ".rb", ".cs", ".kt", ".kts", ".scala", ".php",
+    ".swift", ".lua", ".luau",
+})
+
+
+def _resolve_self_super_calls(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """`this.method()` / `super.method()` for EVERY language, in one shared pass.
+
+    Both shapes are EXACT in any OO language: the receiver names the caller's own class, written in
+    source. Only the spelling differs - self/this/$this, super/base/parent - which is why this is a
+    LanguageConfig lookup (self_receiver_names / super_receiver_names) rather than one resolver per
+    language. Previously only Python resolved them, so `this.helper()` in Java, C#, Kotlin, Scala,
+    PHP, Groovy, Lua, JS/TS and C++ produced an edge ONLY when the method sat in the same file and
+    class; anything inherited or cross-file silently produced nothing.
+
+    `self` resolves against the caller's own class and up its bases; `super` SKIPS the own class and
+    starts at the bases, because resolving to the own class finds the very method making the call.
+
+    EXTRACTED at 1.0 - same standard as a qualified `ClassName.method()`, and bounded to one class
+    hierarchy, so it carries no god-node risk (#543/#1219).
+    """
+    def _key(label: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9]+", "", str(label)).lower()
+
+    node_by_id: dict[str, dict] = {n.get("id"): n for n in all_nodes}
+    method_index: dict[tuple[str, str], str] = {}
+    owner_class_of: dict[str, str] = {}
+    bases_of: dict[str, list[str]] = {}
+    for e in all_edges:
+        rel = e.get("relation")
+        src, tgt = e.get("source"), e.get("target")
+        if rel == "method":
+            tnode = node_by_id.get(tgt)
+            if tnode is not None:
+                method_index[(src, _key(tnode.get("label", "")))] = tgt
+            owner_class_of.setdefault(tgt, src)
+        elif rel == "inherits":
+            bases_of.setdefault(src, []).append(tgt)
+
+    def lookup(cls_nid: str, mk: str, seen: set | None = None) -> str | None:
+        if seen is None:
+            seen = set()
+        if cls_nid in seen:
+            return None
+        seen.add(cls_nid)
+        hit = method_index.get((cls_nid, mk))
+        if hit:
+            return hit
+        for base in bases_of.get(cls_nid, []):
+            found = lookup(base, mk, seen)
+            if found:
+                return found
+        return None
+
+    existing = {(e.get("source"), e.get("target")) for e in all_edges}
+    for result in per_file:
+        for rc in result.get("raw_calls", []):
+            kind = rc.get("receiver_kind")
+            if kind not in ("self", "super"):
+                continue
+            caller, callee = rc.get("caller_nid"), rc.get("callee")
+            if not caller or not callee:
+                continue
+            owner = owner_class_of.get(caller)
+            if not owner:
+                continue
+            mk = _key(callee)
+            target = (
+                lookup(owner, mk)
+                if kind == "self"
+                else next(
+                    (t for base in bases_of.get(owner, []) if (t := lookup(base, mk))), None
+                )
+            )
+            if not target or target == caller or (caller, target) in existing:
+                continue
+            existing.add((caller, target))
+            all_edges.append({
+                "source": caller, "target": target, "relation": "calls", "context": "call",
+                "confidence": "EXTRACTED", "confidence_score": 1.0,
+                "source_file": rc.get("source_file", ""),
+                "source_location": rc.get("source_location"), "weight": 1.0,
+            })
+
+
 def _resolve_python_module_calls(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -11781,6 +11943,12 @@ def _resolve_cpp_calls(
 # registry (framework lives in graphify.resolver_registry). A new language plugs in
 # by adding one register() call below, no edits to extract()'s body. Order
 # preserved from the prior inlined wiring: Swift (#1356) before Python (#1446).
+# Cross-LANGUAGE, not per-language: `this.m()` / `super.m()` resolve identically everywhere, so one
+# pass serves all 14 configs on the shared tree-sitter path. Registered FIRST so a language-specific
+# resolver can still add its own richer edges afterwards (every emitter dedupes on the pair).
+register_language_resolver(
+    LanguageResolver("self_super_calls", _SELF_SUPER_SUFFIXES, _resolve_self_super_calls)
+)
 register_language_resolver(
     LanguageResolver("swift_member_calls", _SWIFT_SUFFIXES, _resolve_swift_member_calls)
 )
