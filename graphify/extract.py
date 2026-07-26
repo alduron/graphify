@@ -2538,12 +2538,20 @@ _GROOVY_CONFIG = LanguageConfig(
     self_receiver_names=frozenset({"this"}),
     super_receiver_names=frozenset({"super"}),
     class_types=frozenset({"class_declaration", "interface_declaration"}),
-    function_types=frozenset({"method_declaration", "constructor_declaration"}),
+    # `function_definition` is the SCRIPT-level `def foo() {...}`, which Groovy uses constantly and
+    # which .gradle build files are made of. Without it a script extracted ZERO code symbols - not
+    # just no call edges, no nodes at all - so build logic was entirely invisible to the graph.
+    function_types=frozenset({"method_declaration", "constructor_declaration", "function_definition"}),
     import_types=frozenset({"import_declaration"}),
     call_types=frozenset({"method_invocation"}),
     call_function_field="name",
     call_accessor_node_types=frozenset(),
-    function_boundary_types=frozenset({"method_declaration", "constructor_declaration"}),
+    # A script-level def's body is a `closure`, not a named `body` field, so without this fallback
+    # the body is never walked and its calls are never seen.
+    body_fallback_child_types=("closure",),
+    function_boundary_types=frozenset(
+        {"method_declaration", "constructor_declaration", "function_definition"}
+    ),
     import_handler=_import_java,
 )
 
@@ -4813,6 +4821,15 @@ def _extract_generic(
                             if child.type in ("simple_identifier", "identifier"):
                                 callee_name = _read_text(child, source)
                                 break
+                        # `this.helper()`: the receiver is the navigation_expression's FIRST child
+                        # (a `this_expression`), which this branch discarded - so Kotlin never had
+                        # a receiver for the shared self/super pass to work with.
+                        if first.children:
+                            head = _read_text(first.children[0], source).strip()
+                            if head in (
+                                config.self_receiver_names | config.super_receiver_names
+                            ):
+                                member_receiver = head
             elif config.ts_module == "tree_sitter_scala":
                 # Scala: first child
                 first = node.children[0] if node.children else None
@@ -4841,6 +4858,13 @@ def _extract_generic(
                             if "." in raw:
                                 callee_name = raw.split(".")[-1]
                                 is_member_call = True
+                                # The receiver half was thrown away here, so `this.Helper()` had
+                                # no receiver and the shared self/super pass could never fire.
+                                head = raw.split(".")[0].strip()
+                                if head in (
+                                    config.self_receiver_names | config.super_receiver_names
+                                ):
+                                    member_receiver = head
                             else:
                                 callee_name = raw
                             break
@@ -4861,6 +4885,15 @@ def _extract_generic(
                     name_node = node.child_by_field_name("name")
                     if name_node:
                         callee_name = _read_text(name_node, source)
+                    # `$this->helper()` / `parent->helper()`: capture the receiver so the shared
+                    # self/super pass can resolve it. Previously dropped, so PHP resolved nothing.
+                    obj_node = node.child_by_field_name("object")
+                    if obj_node is not None:
+                        obj_text = _read_text(obj_node, source).strip()
+                        if obj_text in (
+                            config.self_receiver_names | config.super_receiver_names
+                        ):
+                            member_receiver = obj_text
             elif config.ts_module == "tree_sitter_cpp":
                 # C++: function field, then field_expression/qualified_identifier.
                 # Capture the receiver (object of `->`/`.`, or `::` class scope) and

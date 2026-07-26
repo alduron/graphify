@@ -67,25 +67,10 @@ CASES = [
 ]
 
 
-# Grammars where the receiver is still not captured, so receiver_kind is never stamped and the
-# shared pass cannot fire. The raw call IS recorded (the unresolved_calls diagnostic shows
-# member=1, first_party=1), so the gap is purely receiver capture in these three grammars. Marked
-# xfail rather than deleted so the gap stays VISIBLE in the suite and flips to xpass the moment it
-# is fixed - a silently missing test is how this class of bug survived in the first place.
-_RECEIVER_CAPTURE_TODO = {"csharp", "kotlin", "php"}
-
-
 @pytest.mark.parametrize("lang,bf,bs,cf,cs", CASES, ids=[c[0] for c in CASES])
 def test_this_call_reaches_an_inherited_method_in_another_file(
-    tmp_path: Path, lang: str, bf: str, bs: str, cf: str, cs: str, request
+    tmp_path: Path, lang: str, bf: str, bs: str, cf: str, cs: str
 ):
-    if lang in _RECEIVER_CAPTURE_TODO:
-        request.node.add_marker(
-            pytest.mark.xfail(
-                reason=f"{lang}: `this` receiver not yet captured by walk_calls for this grammar",
-                strict=True,
-            )
-        )
     base = _write(tmp_path / bf, bs)
     child = _write(tmp_path / cf, cs)
 
@@ -123,3 +108,34 @@ def test_python_still_works_after_generalization(tmp_path: Path):
     result = extract([base, child], cache_root=tmp_path / "cache")
 
     assert _has_call_into(result, "go", "base.py")
+
+
+def test_groovy_script_level_defs_produce_symbols_and_calls(tmp_path: Path):
+    """A Groovy SCRIPT (top-level `def`, no class) used to extract ZERO code symbols - only the
+    file node - so .gradle build logic was entirely invisible: nothing to anchor to, search or
+    ranged-read. Worse than a missing edge."""
+    src = _write(
+        tmp_path / "build.groovy",
+        "def helper() { return 1 }\ndef go() { return helper() }\n",
+    )
+
+    result = extract([src], cache_root=tmp_path / "cache")
+
+    labels = {str(n.get("label")) for n in result["nodes"] if n.get("file_type") == "code"}
+    assert "helper()" in labels, f"script-level def not extracted: {sorted(labels)}"
+    assert "go()" in labels
+    assert any(e["relation"] == "calls" for e in result["edges"]), "no call edge in a script"
+
+
+def test_ruby_paren_call_and_self_call_resolve(tmp_path: Path):
+    """Ruby resolves an explicit-paren call and a self-call. A PAREN-LESS call stays unresolved by
+    design (the grammar cannot tell `helper` from a local variable read) -
+    Caveat_RubyParenlessCallsAreNotExtracted."""
+    src = _write(
+        tmp_path / "a.rb",
+        "class A\n  def helper\n    1\n  end\n  def go\n    self.helper\n  end\nend\n",
+    )
+
+    result = extract([src], cache_root=tmp_path / "cache")
+
+    assert any(e["relation"] == "calls" for e in result["edges"])
