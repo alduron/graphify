@@ -2958,6 +2958,91 @@ def _python_param_types(params_node, source: bytes) -> dict[str, str]:
     return out
 
 
+_RUBY_LOCAL_BINDING_TYPES = frozenset({
+    "method_parameters", "block_parameters", "lambda_parameters",
+    "assignment", "operator_assignment", "left_assignment_list", "for", "rescue",
+})
+
+
+def _ruby_scope_locals(body_node, source: bytes) -> set[str]:
+    """Every name BOUND as a local in this Ruby scope - the other half of Ruby's own rule.
+
+    Ruby decides a bare `foo` by binding, not by syntax: if a local named `foo` is bound in scope
+    it is a variable read, otherwise it is a self-send. Collecting the bindings is therefore what
+    makes _ruby_paren_less_sends exact rather than a heuristic.
+
+    Deliberately OVER-collects: anything that even looks like a binding is treated as a local, so a
+    binding form this misses can only cost a MISSING edge, never a wrong one. That is the safe
+    direction, and it matters because Ruby has many binding forms (multiple assignment, block
+    params, `for`, `rescue => e`).
+    """
+    names: set[str] = set()
+
+    # The method's PARAMETERS are a sibling of the body, not inside it, so walking the body alone
+    # misses them - and a parameter shadowing a method name is exactly the case that would produce
+    # a WRONG edge (`def go(helper); helper; end` is a param read, not a call to `helper`).
+    parent = getattr(body_node, "parent", None)
+    if parent is not None:
+        for sibling in parent.children:
+            if sibling.type in ("method_parameters", "block_parameters", "lambda_parameters"):
+                for child in sibling.children:
+                    if child.type == "identifier":
+                        names.add(_read_text(child, source))
+
+    def visit(n) -> None:
+        if n.type in _RUBY_LOCAL_BINDING_TYPES:
+            if n.type in ("assignment", "operator_assignment"):
+                left = n.child_by_field_name("left")
+                targets = [left] if left is not None else []
+                if left is not None and left.type == "left_assignment_list":
+                    targets = list(left.children)
+                for tgt in targets:
+                    if tgt is not None and tgt.type == "identifier":
+                        names.add(_read_text(tgt, source))
+            else:
+                for child in n.children:
+                    if child.type == "identifier":
+                        names.add(_read_text(child, source))
+        for child in n.children:
+            visit(child)
+
+    visit(body_node)
+    return names
+
+
+def _ruby_paren_less_sends(
+    body_node, source: bytes, locals_in_scope: set[str]
+) -> list[tuple[str, int]]:
+    """Bare `identifier` nodes in a Ruby body that are self-sends, as (name, line).
+
+    Skips anything bound as a local, anything capitalized (a constant, not a method), and any
+    identifier that is part of a larger expression which already handles it - a call's own method
+    name, an assignment target, a parameter, or the receiver/method of an explicit call node -
+    so the same call is never counted twice.
+    """
+    skip_parents = {
+        "call", "method_call", "assignment", "operator_assignment",
+        "method_parameters", "block_parameters", "lambda_parameters",
+        "method", "singleton_method", "class", "module", "left_assignment_list",
+    }
+    out: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+
+    def visit(n) -> None:
+        for child in n.children:
+            if child.type == "identifier" and n.type not in skip_parents:
+                name = _read_text(child, source)
+                if name and name[:1].islower() and name not in locals_in_scope:
+                    key = (name, child.start_point[0] + 1)
+                    if key not in seen:
+                        seen.add(key)
+                        out.append(key)
+            visit(child)
+
+    visit(body_node)
+    return out
+
+
 def _python_collect_return_types(root_node, source: bytes) -> dict[str, str]:
     """``function_name -> annotated return TYPE NAME`` for every def in this file.
 
@@ -5273,6 +5358,38 @@ def _extract_generic(
 
     for caller_nid, body_node in function_bodies:
         walk_calls(body_node, caller_nid)
+
+    if config.ts_module == "tree_sitter_ruby":
+        # Ruby's paren-less self-send (`helper` with no parens and no receiver) is the DOMINANT
+        # call style, and it never reaches walk_calls: the grammar emits a bare `identifier`, not a
+        # `call` node, so these calls were entirely absent from Ruby graphs.
+        #
+        # Disambiguating it is NOT a guess - it is Ruby's own rule: a bare name is a local variable
+        # read if a local of that name is bound in scope, and a method call (self-send) otherwise.
+        # _ruby_scope_locals collects exactly those bindings (params, assignments, block params,
+        # for-vars, rescue bindings), and anything left is a call by the language's definition.
+        #
+        # Emission is additionally self-limiting: an unresolvable name simply produces no edge,
+        # because these go through the SAME label_to_nid / raw_calls path as every other call.
+        for caller_nid, body_node in function_bodies:
+            locals_in_scope = _ruby_scope_locals(body_node, source)
+            for name, line in _ruby_paren_less_sends(body_node, source, locals_in_scope):
+                tgt_nid = label_to_nid.get(name)
+                if tgt_nid and tgt_nid != caller_nid:
+                    pair = (caller_nid, tgt_nid)
+                    if pair not in seen_call_pairs:
+                        seen_call_pairs.add(pair)
+                        edges.append({
+                            "source": caller_nid, "target": tgt_nid, "relation": "calls",
+                            "context": "call", "confidence": "EXTRACTED",
+                            "source_file": str_path, "source_location": f"L{line}", "weight": 1.0,
+                        })
+                elif not tgt_nid:
+                    raw_calls.append({
+                        "caller_nid": caller_nid, "callee": name, "is_member_call": False,
+                        "source_file": str_path, "source_location": f"L{line}",
+                        "receiver": None, "receiver_kind": "",
+                    })
 
     # #1356: walk property/field initializers (collected above). walk_calls
     # self-guards against re-entering function bodies and dedups via
