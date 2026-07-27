@@ -20,6 +20,7 @@ from .resolver_registry import (
     run_language_resolvers,
 )
 from .ruby_resolution import resolve_ruby_member_calls
+from .spans import annotate_symbol_spans
 
 # --- migrated to graphify/extractors/ (see graphify/extractors/MIGRATION.md) ---
 from graphify.extractors.base import (  # noqa: F401
@@ -15765,7 +15766,11 @@ def _safe_extract_with_xaml_root(extractor, path: Path, root: Path) -> dict:
     previous_root = _XAML_ACTIVE_EXTRACT_ROOT
     _XAML_ACTIVE_EXTRACT_ROOT = root.resolve()
     try:
-        return _safe_extract(extractor, path)
+        # Span + body hash annotation rides HERE, the one choke point both the parallel and the
+        # sequential extraction paths share, and upstream of save_cached so the derived fields are
+        # cached with the rest of the result. See spans.py for why it is not done at the 56 node
+        # emission sites.
+        return annotate_symbol_spans(_safe_extract(extractor, path), path)
     finally:
         _XAML_ACTIVE_EXTRACT_ROOT = previous_root
 

@@ -96,7 +96,9 @@ _stat_index_dirty: bool = False
 
 # Modules whose source determines what an extraction PRODUCES. Their content is folded into every
 # cache key so an extractor change self-invalidates the cache.
-_EXTRACTOR_MODULES = ("extract.py", "ids.py", "ruby_resolution.py", "resolver_registry.py")
+_EXTRACTOR_MODULES = (
+    "extract.py", "ids.py", "ruby_resolution.py", "resolver_registry.py", "spans.py",
+)
 
 
 @functools.lru_cache(maxsize=1)
