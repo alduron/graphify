@@ -1388,6 +1388,52 @@ def test_extract_tsx_uses_tsx_grammar():
     assert _TS_CONFIG.ts_language_fn == "language_typescript"
 
 
+# ── `feeds` edge: JSX prop <- hook return / plain identifier (Plan 59 Phase 5) ─
+# Answers "what feeds this UI element" (e.g. `useSessionOptions`) without
+# grepping the prop name. Derived from (1) a JSX attribute bound to a plain
+# in-file identifier and (2) a hook's return value reaching a prop.
+
+def test_feeds_edge_plain_identifier_into_jsx_prop():
+    """A module-level const referenced directly as a JSX prop value feeds the
+    JSX element it is passed to."""
+    from graphify.extract import extract_js
+    result = extract_js(FIXTURES / "feeds_plain_identifier.tsx")
+    nodes_by_id = {n["id"]: n for n in result["nodes"]}
+    feeds = [e for e in result["edges"] if e["relation"] == "feeds"]
+    assert feeds, f"no feeds edge emitted: {result['edges']}"
+    edge = feeds[0]
+    assert "greeting" in nodes_by_id[edge["source"]]["label"]
+    assert "Header" in nodes_by_id[edge["target"]]["label"]
+    assert edge.get("context") == "label"
+
+
+def test_feeds_edge_hook_return_into_jsx_prop():
+    """`const { sessionOptions } = useSessionOptions()` then
+    `<SessionForm options={sessionOptions} />` must feed useSessionOptions ->
+    SessionForm, so "what feeds sessionOptions" is answerable without a grep."""
+    from graphify.extract import extract_js
+    result = extract_js(FIXTURES / "feeds_hook_return.tsx")
+    nodes_by_id = {n["id"]: n for n in result["nodes"]}
+    feeds = [e for e in result["edges"] if e["relation"] == "feeds"]
+    assert feeds, f"no feeds edge emitted: {result['edges']}"
+    edge = feeds[0]
+    assert "useSessionOptions" in nodes_by_id[edge["source"]]["label"]
+    assert "SessionForm" in nodes_by_id[edge["target"]]["label"]
+    assert edge.get("context") == "options"
+
+
+def test_feeds_edge_never_emitted_for_non_js_language():
+    """Negative case: the shared walk_calls receiver-capture pass (which now
+    also scans local declarations for hook bindings) must leave a non-JS
+    grammar untouched even though it too has local var declarations and calls
+    (Caveat_GraphifyReceiverCaptureIsSharedGateItPerLang)."""
+    from graphify.extract import extract_python
+    result = extract_python(FIXTURES / "sample.py")
+    assert "error" not in result
+    relations = {e["relation"] for e in result["edges"]}
+    assert "feeds" not in relations
+
+
 # --- Windows-spawn ProcessPool fallback (regression for #?) ---
 # When the caller has no `if __name__ == "__main__":` guard, ProcessPoolExecutor
 # on Windows raises BrokenProcessPool before any work completes. extract() must

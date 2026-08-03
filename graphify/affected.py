@@ -21,6 +21,7 @@ DEFAULT_AFFECTED_RELATIONS = (
     "uses",
     "mixes_in",
     "embeds",
+    "feeds",
 )
 
 

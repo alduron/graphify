@@ -88,6 +88,7 @@ _JS_INDEX_FILES = ("index.ts", "index.tsx", "index.svelte", "index.js", "index.j
 SEMANTIC_RELATIONS = frozenset({
     "inherits", "implements", "mixes_in", "embeds", "references",
     "calls", "imports", "imports_from", "re_exports", "contains", "method",
+    "feeds",
 })
 
 REFERENCE_CONTEXTS = frozenset({
@@ -2273,6 +2274,71 @@ def _js_member_assignment_target(left, source: bytes):
             if inner_prop_name == "prototype":
                 return ("prototype", inner_obj_name, member_name)
     return None
+
+
+# ── JSX `feeds` edge helpers (Plan 59 Phase 5, JS/TS-only) ────────────────────
+# tree-sitter's TSX grammar gives `jsx_attribute` no named "name"/"value" fields
+# (verified live against tree-sitter-typescript's language_tsx: the attribute
+# name and its `{ expr }` value are plain positional named children), so they
+# are read positionally here rather than via child_by_field_name.
+
+def _jsx_attribute_parts(node):
+    """A jsx_attribute's (name_node, value_node) pair; value_node is None for a
+    valueless boolean attribute (`<Foo disabled />`)."""
+    named = [c for c in node.children if c.is_named]
+    if not named:
+        return None, None
+    return named[0], (named[1] if len(named) > 1 else None)
+
+
+def _jsx_expression_inner(node):
+    """The single expression a `jsx_expression` ({ expr }) wraps, or None."""
+    for c in node.children:
+        if c.is_named:
+            return c
+    return None
+
+
+def _js_hook_call_target(value_node):
+    """If `value_node` is a (possibly awaited) call to a plain identifier
+    callee, return that callee's identifier node; else None. Naming-convention
+    filtering (React's `use*` hooks) happens at the call site, not here."""
+    node = value_node
+    if node.type == "await_expression":
+        node = next((c for c in node.children if c.type == "call_expression"), None)
+        if node is None:
+            return None
+    if node.type != "call_expression":
+        return None
+    func_node = node.child_by_field_name("function")
+    if func_node is None or func_node.type != "identifier":
+        return None
+    return func_node
+
+
+def _js_pattern_bound_names(name_node, source: bytes) -> list[str]:
+    """Local names bound by a JS/TS declarator's `name` pattern.
+
+    Handles the common shapes only - identifier, `{a, b: renamed}`,
+    `[a, b]` - deliberately narrow for the `feeds` hook-binding heuristic;
+    nested/rest sub-patterns are skipped rather than guessed at.
+    """
+    if name_node.type == "identifier":
+        return [_read_text(name_node, source)]
+    names: list[str] = []
+    if name_node.type == "object_pattern":
+        for child in name_node.children:
+            if child.type == "shorthand_property_identifier_pattern":
+                names.append(_read_text(child, source))
+            elif child.type == "pair_pattern":
+                value = child.child_by_field_name("value")
+                if value is not None and value.type == "identifier":
+                    names.append(_read_text(value, source))
+    elif name_node.type == "array_pattern":
+        for child in name_node.children:
+            if child.type == "identifier":
+                names.append(_read_text(child, source))
+    return names
 
 
 def _js_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
@@ -4833,6 +4899,11 @@ def _extract_generic(
     # JS/TS mirror of python_var_types / python_field_types.
     js_var_types: dict[str, dict[str, str | None]] = {}
     js_field_types: dict[str, dict[str, str]] = {}
+    # JS/TS only (Plan 59 Phase 5): caller_nid -> {local_name: hook_call_target_nid},
+    # populated from `const { a } = useThing()` / `const a = useThing()` bindings
+    # and read back when a JSX attribute's value is that same identifier, to emit
+    # a `feeds` edge from the hook straight to the JSX element it fills a prop on.
+    js_hook_bindings: dict[str, dict[str, str]] = {}
 
     def _php_class_const_scope(n) -> str | None:
         scope = n.child_by_field_name("scope")
@@ -4853,6 +4924,71 @@ def _extract_generic(
         # later `Inv->method()` resolves cross-file (mirrors Swift's type table).
         if config.ts_module == "tree_sitter_cpp" and node.type == "declaration":
             _cpp_capture_local_decl(node, source, type_table)
+
+        # React hook return -> local binding capture, feeding the `feeds` edge
+        # below: `const { a } = useThing()` binds a -> useThing so a later JSX
+        # attribute `x={a}` resolves back to the hook. JS/TS only - walk_calls
+        # is the SHARED cross-language call-graph pass
+        # (Caveat_GraphifyReceiverCaptureIsSharedGateItPerLang), so this must
+        # stay gated or it starts misreading other grammars' local declarations.
+        if (config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript")
+                and node.type in ("lexical_declaration", "variable_declaration")):
+            for declarator in node.children:
+                if declarator.type != "variable_declarator":
+                    continue
+                value_node = declarator.child_by_field_name("value")
+                name_node = declarator.child_by_field_name("name")
+                if value_node is None or name_node is None:
+                    continue
+                func_node = _js_hook_call_target(value_node)
+                if func_node is None:
+                    continue
+                hook_name = _read_text(func_node, source)
+                # React convention: a hook is named `use` + an uppercase letter
+                # (useThing, useSessionOptions, ...) - `used`/`user`/`useful`
+                # are ordinary identifiers, not hooks, and must not match.
+                if not (hook_name.startswith("use") and len(hook_name) > 3
+                        and hook_name[3].isupper()):
+                    continue
+                hook_line = func_node.start_point[0] + 1
+                hook_nid = label_to_nid.get(hook_name) or ensure_named_node(hook_name, hook_line)
+                bindings = js_hook_bindings.setdefault(caller_nid, {})
+                for bound_name in _js_pattern_bound_names(name_node, source):
+                    bindings[bound_name] = hook_nid
+
+        # JSX prop binding -> `feeds` edge: a value flowing from a hook call or
+        # a known in-file symbol into a JSX element's prop, answering "what
+        # feeds this UI element" without grepping the prop name (Plan 59 Phase
+        # 5). JS/TS only - see the gating note above.
+        if (config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript")
+                and node.type == "jsx_attribute"):
+            attr_name_node, attr_value_node = _jsx_attribute_parts(node)
+            if (attr_name_node is not None and attr_value_node is not None
+                    and attr_value_node.type == "jsx_expression"):
+                expr = _jsx_expression_inner(attr_value_node)
+                if expr is not None and expr.type == "identifier":
+                    var_name = _read_text(expr, source)
+                    # (2) the hook-return path, else (1) a plain reference to an
+                    # already-known in-file symbol (e.g. a module-level const).
+                    source_nid = (js_hook_bindings.get(caller_nid, {}).get(var_name)
+                                  or label_to_nid.get(var_name))
+                    if source_nid is not None:
+                        element = node.parent  # jsx_opening_element | jsx_self_closing_element
+                        elem_name_node = (
+                            element.child_by_field_name("name") if element is not None else None
+                        )
+                        if elem_name_node is not None and elem_name_node.type == "identifier":
+                            tag_name = _read_text(elem_name_node, source)
+                            # Lowercase tags are host DOM elements (div, span,
+                            # ...), never components - skip them so `feeds`
+                            # never targets a phantom stub for every <div>.
+                            if tag_name[:1].isupper():
+                                attr_name = _read_text(attr_name_node, source)
+                                line = node.start_point[0] + 1
+                                target_nid = ensure_named_node(tag_name, line)
+                                if target_nid != source_nid:
+                                    add_edge(source_nid, target_nid, "feeds", line,
+                                             context=attr_name)
 
         if node.type in config.call_types:
             # JS/TS dynamic imports: await import('./foo.js')
