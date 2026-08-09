@@ -4329,6 +4329,7 @@ def main() -> None:
         cli_cargo: bool = False
         no_cluster = False
         dedup_llm = False
+        no_semantic = False
         google_workspace = False
         global_merge = False
         global_repo_tag: str | None = None
@@ -4389,6 +4390,8 @@ def main() -> None:
                 no_cluster = True; i += 1
             elif a == "--dedup-llm":
                 dedup_llm = True; i += 1
+            elif a == "--no-semantic":
+                no_semantic = True; i += 1
             elif a == "--google-workspace":
                 google_workspace = True; i += 1
             elif a == "--global":
@@ -4512,6 +4515,21 @@ def main() -> None:
             unchanged_total = 0
 
         semantic_files = doc_files + paper_files + image_files
+        if no_semantic and semantic_files:
+            # AST-only corpus (--no-semantic). A doc-classified file that HAS a deterministic
+            # extractor is real structure, not prose to summarise: markdown headings and yaml keys
+            # come from extract_markdown / extract_yaml with no API key. Route those through the
+            # code path and drop the rest, so the run never reaches the needs_llm exit below.
+            from graphify.extract import _get_extractor as _extractor_for
+            parseable = [p for p in semantic_files if _extractor_for(p) is not None]
+            dropped = len(semantic_files) - len(parseable)
+            code_files.extend(parseable)
+            print(
+                f"[graphify extract] --no-semantic: {len(parseable)} doc file(s) routed to the AST "
+                f"path, {dropped} skipped (no deterministic extractor)"
+            )
+            doc_files, paper_files, image_files = [], [], []
+            semantic_files = []
         if incremental_mode:
             print(
                 f"[graphify extract] {len(code_files)} code, {len(doc_files)} docs, "
