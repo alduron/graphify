@@ -15705,6 +15705,171 @@ def extract_terraform(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+# YAML structural extraction (#1544). Bounds mirror extract_json's: a config/manifest
+# file yields its section tree, a data dump yields nothing useful and must not be
+# allowed to swamp the graph with orphan key-nodes.
+_YAML_MAX_BYTES = 1_048_576   # 1 MiB - skip fixture dumps / generated manifests
+_YAML_MAX_DEPTH = 3           # top-level + two nested levels
+_YAML_MAX_NODES = 400         # per file, across all depths
+_YAML_MAX_CHILDREN = 40       # per parent - a wider fan-out is data, not sections
+
+# A block-mapping key line. `dash` captures any leading sequence markers so a
+# `- name: x` row is recognised (and then deliberately skipped, see below); the key
+# itself may be plain, single- or double-quoted.
+_YAML_KEY_RE = re.compile(
+    r'^(?P<indent> *)(?P<dash>(?:- +)*)'
+    r'(?P<key>"[^"\n]+"|\'[^\'\n]+\'|[^\s#\'"][^:#\n]*?)'
+    r' *:(?P<rest> .*|)$'
+)
+
+
+def extract_yaml(path: Path) -> dict:
+    """Extract the section tree from a YAML config/manifest file.
+
+    Produces nodes for:
+    - The file itself
+    - Each block-mapping key down to `_YAML_MAX_DEPTH`, labelled by its DOTTED PATH
+      (`search.departments`, not `departments`) so the label is unique within the file
+      and an anchor reads `profile/config.yaml::search.departments`.
+
+    Produces `contains` edges file -> top-level key -> nested key.
+
+    Deliberately skipped, for the same reason extract_json skips data-shaped JSON
+    (#1224): keys nested inside a SEQUENCE item (`- name: x`), which are data rows
+    rather than configuration sections and fan out without bound; anything past the
+    depth cap; and the contents of block scalars (`|` / `>`), whose indented body
+    lines would otherwise parse as keys.
+
+    No tree-sitter and no PyYAML dependency - pure line-by-line parsing, the same
+    approach as extract_markdown. YAML forbids tab indentation, so a tab-indented
+    line is treated as non-structural and skipped rather than mis-levelled.
+    """
+    try:
+        with path.open("rb") as fh:
+            raw = fh.read(_YAML_MAX_BYTES + 1)
+        if len(raw) > _YAML_MAX_BYTES:
+            return {"nodes": [], "edges": [], "error": "yaml file too large to index"}
+        source = raw.decode("utf-8", errors="replace")
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    stem = _file_stem(path)
+    str_path = str(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+    _claimed_nids: dict[str, str] = {}
+
+    def add_node(nid: str, label: str, line: int) -> None:
+        nid = _claim_nid(nid, label, seen_ids, _claimed_nids)
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({"id": nid, "label": label, "file_type": "config",
+                          "source_file": str_path, "source_location": f"L{line}"})
+
+    file_nid = _make_id(str(path))
+    add_node(file_nid, path.name, 1)
+
+    # (indent, nid, dotted_path, child_count) for each open ancestor mapping.
+    stack: list[list[Any]] = []
+    # Indent of the key that opened a block scalar; every more-indented line below it
+    # is opaque text. None when not inside one.
+    block_scalar_indent: int | None = None
+    # Column at which the body of the innermost open SEQUENCE ITEM starts. A `- repo: x`
+    # row's sibling keys sit on their own lines with no dash of their own (pre-commit's
+    # `hooks:`, a compose service, a k8s container), so recognising only the dashed line
+    # would let every following row-field through as if it were a mapping section. While
+    # this is set, any key at or past that column is a data row and is skipped.
+    seq_body_indent: int | None = None
+    emitted = 0
+
+    for line_num_0, line_text in enumerate(source.splitlines()):
+        line_num = line_num_0 + 1
+        if emitted >= _YAML_MAX_NODES:
+            break
+
+        if not line_text.strip() or line_text.lstrip().startswith("#"):
+            continue
+        if line_text.startswith("\t") or line_text.lstrip(" ").startswith("\t"):
+            continue
+        if line_text.startswith(("---", "...")):
+            stack.clear()
+            block_scalar_indent = None
+            seq_body_indent = None
+            continue
+
+        indent = len(line_text) - len(line_text.lstrip(" "))
+
+        if block_scalar_indent is not None:
+            if indent > block_scalar_indent:
+                continue
+            block_scalar_indent = None
+
+        # Dedenting out to (or past) the dash column ends the sequence item's body.
+        if seq_body_indent is not None and indent < seq_body_indent:
+            seq_body_indent = None
+
+        m = _YAML_KEY_RE.match(line_text)
+        if m is None:
+            continue
+
+        rest = m.group("rest").strip()
+        # A key introducing a block scalar: remember its indent so the body is skipped.
+        opens_block_scalar = rest[:1] in ("|", ">")
+        dash = m.group("dash")
+
+        # Inside a sequence item: a data row, not a section. Skip it, and leave the
+        # ancestor stack alone - its indents are mapping-key indents.
+        if dash or seq_body_indent is not None:
+            if opens_block_scalar:
+                block_scalar_indent = indent
+            if dash and seq_body_indent is None:
+                seq_body_indent = indent + len(dash)
+            continue
+
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+
+        key = m.group("key").strip().strip("\"'")
+        if not key:
+            continue
+        parent_nid = stack[-1][1] if stack else file_nid
+        parent_path = stack[-1][2] if stack else ""
+        dotted = f"{parent_path}.{key}" if parent_path else key
+
+        if opens_block_scalar:
+            block_scalar_indent = indent
+
+        # Depth cap and per-parent fan-out cap. Both still push onto the stack so the
+        # indent bookkeeping for deeper lines stays correct; they just emit nothing.
+        depth = len(stack) + 1
+        over_depth = depth > _YAML_MAX_DEPTH
+        if stack:
+            stack[-1][3] += 1
+            over_fanout = stack[-1][3] > _YAML_MAX_CHILDREN
+        else:
+            over_fanout = False
+
+        # A skipped parent ("" nid) means this key would be an orphan with no contains
+        # edge, which is exactly the disconnected-component noise #1224 warned about -
+        # skip the whole subtree, keeping only the indent bookkeeping.
+        if over_depth or over_fanout or not parent_nid:
+            stack.append([indent, "", dotted, 0])
+            continue
+
+        nid = _make_id(stem, dotted)
+        if nid in seen_ids:
+            nid = _make_id(stem, dotted, str(line_num))
+        add_node(nid, dotted, line_num)
+        emitted += 1
+        edges.append({"source": parent_nid, "target": nid, "relation": "contains",
+                      "confidence": "EXTRACTED", "source_file": str_path,
+                      "source_location": f"L{line_num}", "weight": 1.0})
+        stack.append([indent, nid, dotted, 0])
+
+    return {"nodes": nodes, "edges": edges}
+
+
 _DISPATCH: dict[str, Any] = {
     ".py": extract_python,
     ".js": extract_js,
@@ -15778,6 +15943,11 @@ _DISPATCH: dict[str, Any] = {
     ".sh": extract_bash,
     ".bash": extract_bash,
     ".json": extract_json,
+    # Registering these also puts them in `collect_files`'s walk set, which is what
+    # makes `is_package_manifest_path`'s apm.yml branch in `_get_extractor` reachable
+    # at all (a suffix absent from _DISPATCH is never even enumerated).
+    ".yaml": extract_yaml,
+    ".yml": extract_yaml,
     ".tf": extract_terraform,
     ".tfvars": extract_terraform,
     ".hcl": extract_terraform,
