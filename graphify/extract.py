@@ -12595,7 +12595,13 @@ _MD_WIKILINK_RE = re.compile(r'(?<!\!)\[\[([^\]|#]+)(?:[#|][^\]]*)?\]\]')
 # Extensions graphify creates document file nodes for. A link to one of these
 # resolves to that file's node; links to code/assets are skipped (left to the
 # language extractors).
+# Every entry must also be in _DISPATCH: collect_files enumerates only _DISPATCH
+# suffixes, so an ext claimed here and absent there yields an edge to a node the
+# walk never creates. test_markdown_linkable_exts_are_all_walkable holds them together.
 _MD_LINKABLE_EXTS = {".md", ".mdx", ".qmd", ".markdown", ".rst", ".txt"}
+
+# Documents are read whole and .txt is an open grab bag, so cap it as JSON/YAML are.
+_MD_MAX_BYTES = 1_048_576  # 1 MiB
 
 
 def _resolve_markdown_link(raw: str, source_dir: Path) -> "Path | None":
@@ -12660,7 +12666,11 @@ def extract_markdown(path: Path) -> dict:
     No tree-sitter dependency — pure line-by-line parsing.
     """
     try:
-        source = path.read_text(encoding="utf-8", errors="replace")
+        with path.open("rb") as fh:
+            raw = fh.read(_MD_MAX_BYTES + 1)
+        if len(raw) > _MD_MAX_BYTES:
+            return {"nodes": [], "edges": [], "error": "document too large to index"}
+        source = raw.decode("utf-8", errors="replace")
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
@@ -15931,6 +15941,12 @@ _DISPATCH: dict[str, Any] = {
     ".md": extract_markdown,
     ".mdx": extract_markdown,
     ".qmd": extract_markdown,
+    # Registering these is what puts them in collect_files's walk set, so a link
+    # to one resolves to a node that actually exists. _MD_LINKABLE_EXTS already
+    # claimed all three; without this they were link targets nothing ever created.
+    ".markdown": extract_markdown,
+    ".rst": extract_markdown,
+    ".txt": extract_markdown,
     ".pas": extract_pascal,
     ".pp": extract_pascal,
     ".dpr": extract_pascal,

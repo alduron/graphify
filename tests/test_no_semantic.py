@@ -31,8 +31,11 @@ def _corpus(tmp_path: Path) -> Path:
     (tmp_path / "docs" / "guide.md").write_text("# Guide\n\n## Install\n\n## Usage\n", encoding="utf-8")
     (tmp_path / "config.yaml").write_text("search:\n  limit: 5\n", encoding="utf-8")
     (tmp_path / "mod.py").write_text("def run():\n    return 1\n", encoding="utf-8")
-    # No extractor for .txt, so it is the one that must be dropped rather than routed.
+    # .txt gained the markdown extractor (Plan 62 Phase 2), so it now ROUTES rather than drops.
     (tmp_path / "notes.txt").write_text("loose prose\n", encoding="utf-8")
+    # .html is classified DOCUMENT and has no deterministic extractor, so it is now the one
+    # that must be dropped rather than routed.
+    (tmp_path / "page.html").write_text("<p>loose markup</p>\n", encoding="utf-8")
     return tmp_path
 
 
@@ -81,7 +84,9 @@ def test_a_document_with_no_extractor_is_dropped_and_counted(tmp_path):
     # Reported, never silent: a caller must be able to see what the corpus lost.
     assert "--no-semantic:" in proc.stdout
     assert "1 skipped" in proc.stdout
-    assert not any(str(n.get("label")) == "notes.txt" for n in _nodes(out))
+    assert not any(str(n.get("label")) == "page.html" for n in _nodes(out))
+    # The counterpart: a document type that DOES have an extractor is routed, not dropped.
+    assert any(str(n.get("label")) == "notes.txt" for n in _nodes(out))
 
 
 def test_a_code_only_corpus_is_unaffected_by_the_flag(tmp_path):
