@@ -468,7 +468,10 @@ def test_collect_files_parity_with_legacy_synthetic(tmp_path):
     (tmp_path / "src" / "deep").mkdir(parents=True)
     (tmp_path / "src" / "app.py").write_text("x = 1")
     (tmp_path / "src" / "deep" / "lib.ts").write_text("export const x = 1")
-    (tmp_path / "src" / "deep" / "notes.txt").write_text("not code")
+    # .txt is a walked DOCUMENT format (Plan 62 Phase 2), so it is collected, not skipped.
+    (tmp_path / "src" / "deep" / "notes.txt").write_text("prose, not code")
+    # An extension absent from _DISPATCH is what must be skipped; .txt no longer plays that role.
+    (tmp_path / "src" / "deep" / "blob.bin").write_text("not dispatched")
     # Fortran case distinction: .f and .F are distinct dispatch entries
     (tmp_path / "src" / "legacy.f").write_text("      END")
     (tmp_path / "src" / "modern.F").write_text("      END")
@@ -492,7 +495,7 @@ def test_collect_files_parity_with_legacy_synthetic(tmp_path):
     result = collect_files(tmp_path)
     assert result == _legacy_collect_files(tmp_path)
     names = {f.name for f in result}
-    assert names == {"app.py", "lib.ts", "legacy.f", "modern.F", "ci.sh", "keep.py"}
+    assert names == {"app.py", "lib.ts", "legacy.f", "modern.F", "ci.sh", "keep.py", "notes.txt"}
 
 
 def test_collect_files_walks_each_directory_once(tmp_path, monkeypatch):
