@@ -119,13 +119,22 @@ _CLASS_PLACEHOLDERS: frozenset[str] = frozenset(
 
 _UE_CLASS_NAME = re.compile(r"^[UAFIES][A-Z][A-Za-z0-9_]+$", re.ASCII)
 
+# Every little-endian int32 encoding of an accepted length (2..256): [L,00,00,00]
+# for 2..255, [00,01,00,00] for 256. No other prefix can start a record.
+_LEN_PREFIX = re.compile(rb"[\x02-\xff]\x00\x00\x00|\x00\x01\x00\x00")
+
 
 def _scan_fstrings(data: bytes) -> list[str]:
     """Walk the bytes for <int32 length><ASCII bytes><NUL> records (the UE
     FString serialisation used by every name-table entry) and return them in
-    file order. Version-independent: no PackageFileSummary offsets needed."""
+    file order. Version-independent: no PackageFileSummary offsets needed.
+
+    Advances by seeking the next `_LEN_PREFIX` candidate rather than by one byte,
+    which is output-identical because a record can only begin at such a prefix.
+    """
     out: list[str] = []
     n = len(data)
+    search = _LEN_PREFIX.search
     pos = 4  # skip the magic
     while pos + 5 <= n:
         length = int.from_bytes(data[pos : pos + 4], "little", signed=True)
@@ -137,7 +146,10 @@ def _scan_fstrings(data: bytes) -> list[str]:
                     out.append(payload.decode("ascii", errors="replace"))
                     pos += 4 + length
                     continue
-        pos += 1
+        m = search(data, pos + 1)
+        if m is None:
+            break
+        pos = m.start()
     return out
 
 
