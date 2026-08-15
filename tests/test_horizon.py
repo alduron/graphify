@@ -12,12 +12,13 @@ fixtures readable and version-controllable.
 """
 from __future__ import annotations
 
+import random
 import struct
 from pathlib import Path
 
 from graphify.horizon import HORIZON_SCHEMA_VERSION, build_horizon_sections
 from graphify.literals import build_literal_index, extract_file_literals
-from graphify.unreal_assets import scan_asset_file, scan_assets
+from graphify.unreal_assets import _scan_fstrings, scan_asset_file, scan_assets
 
 FIXTURES = Path(__file__).parent / "fixtures" / "ue_horizon"
 _UASSET_MAGIC = 0x9E2A83C1
@@ -231,6 +232,60 @@ def test_malformed_uasset_does_not_crash(tmp_path: Path) -> None:
     garbage.write_bytes(struct.pack("<I", _UASSET_MAGIC) + b"\xff" * 200)
     rec = scan_asset_file(garbage)
     assert rec is None or isinstance(rec, dict)
+
+
+def _scan_fstrings_reference(data: bytes) -> list[str]:
+    """The one-byte-at-a-time scan `_scan_fstrings` replaced, kept as the oracle."""
+    out: list[str] = []
+    n = len(data)
+    pos = 4
+    while pos + 5 <= n:
+        length = int.from_bytes(data[pos : pos + 4], "little", signed=True)
+        if 2 <= length <= 256 and pos + 4 + length <= n:
+            body = data[pos + 4 : pos + 4 + length]
+            if body.endswith(b"\x00"):
+                payload = body.rstrip(b"\x00")
+                if payload and all(32 <= b < 127 for b in payload):
+                    out.append(payload.decode("ascii", errors="replace"))
+                    pos += 4 + length
+                    continue
+        pos += 1
+    return out
+
+
+def test_fstring_scan_matches_the_byte_at_a_time_reference() -> None:
+    """The prefix-seeking scan must see exactly what an exhaustive scan sees.
+
+    Includes the two boundary lengths (2 and 256) and adversarial filler, since
+    the whole speedup rests on no valid record starting at a skipped offset.
+    """
+    rng = random.Random(1234)
+    cases: list[bytes] = [
+        _make_uasset_raw(["/Script/GameplayAbilities.GameplayAbility", "Ability.Burn"]),
+        _make_uasset_raw(["AB", "X" * 255]),  # shortest and longest inline lengths
+        struct.pack("<I", _UASSET_MAGIC) + b"\x00" * 512,
+        struct.pack("<I", _UASSET_MAGIC) + b"\xff" * 512,
+    ]
+    # A 256-byte payload behind filler that fails to parse. Length 256 is the one
+    # encoding whose prefix is not [L,00,00,00], so it is only reachable if the
+    # skip understands [00,01,00,00) -- and it must sit AFTER a failed offset, or
+    # the scan starts on it and never jumps at all.
+    cases.append(
+        struct.pack("<I", _UASSET_MAGIC)
+        + b"\xff\xff\xff\xff"
+        + struct.pack("<i", 256)
+        + b"N" * 255
+        + b"\x00"
+    )
+    # Random binary is the real adversary: it lands arbitrary bytes next to
+    # plausible prefixes, which is exactly where a bad skip would show up.
+    for _ in range(40):
+        cases.append(
+            struct.pack("<I", _UASSET_MAGIC)
+            + bytes(rng.randrange(256) for _ in range(rng.randrange(64, 1024)))
+        )
+    for blob in cases:
+        assert _scan_fstrings(blob) == _scan_fstrings_reference(blob)
 
 
 def test_scan_assets_deterministic_and_relative(tmp_path: Path) -> None:
