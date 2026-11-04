@@ -710,6 +710,9 @@ def _is_noise_dir(part: str, parent: "Path | None" = None) -> bool:
         return True
     if part.endswith(".egg-info"):
         return True
+    # _scratch, _scratch_foo: agent scratch dirs, throwaway by definition
+    if part.startswith("_scratch"):
+        return True
     # worktrees/ nested inside a dotted dir (e.g. .claude/worktrees/, .git/worktrees/)
     if part == "worktrees" and parent is not None and parent.name.startswith("."):
         return True
