@@ -1565,3 +1565,12 @@ def test_is_nested_repo_root_plain_dir_is_walked(tmp_path):
     plain = tmp_path / "src"
     plain.mkdir()
     assert detect_mod._is_nested_repo_root(plain) is False
+
+
+def test_scratch_dirs_are_excluded(tmp_path):
+    for d, n in (("_scratch", "a"), ("_scratch_x", "b"), (".", "keep")):
+        (tmp_path / d).mkdir(exist_ok=True)
+        (tmp_path / d / f"{n}.py").write_text(f"def {n}():\n    return 1\n")
+    files = [Path(f).name for fs in detect(tmp_path)["files"].values() for f in fs]
+    assert "keep.py" in files
+    assert "a.py" not in files and "b.py" not in files
