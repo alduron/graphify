@@ -1,0 +1,58 @@
+name: automerge
+
+# Lands a PR into v8 once the independent review stage labels it review:approved and every other
+# check on the head sha is green. Mirrors the cli/api automerge policy in a minimal form: graphify
+# has no approval-gate job, so the label itself is the approval and a head move after labeling
+# needs a fresh label (the synchronize job drops a stale one).
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+    branches: ["v8"]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+concurrency:
+  group: automerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  drop-stale-label:
+    if: github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'review:approved')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove review:approved from an unreviewed head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr edit "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --remove-label review:approved
+
+  merge:
+    if: >-
+      github.event.action == 'labeled' && github.event.label.name == 'review:approved' &&
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge when every other check on the head is green
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Every check-run on the head except this workflow's own jobs must be completed and
+          # successful (or skipped/neutral). Anything pending or failed leaves the PR open.
+          bad=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" --paginate \
+            --jq '.check_runs[] | select(.name != "merge" and .name != "drop-stale-label")
+                  | select(.status != "completed" or (.conclusion | IN("success","skipped","neutral") | not))
+                  | .name' | sort -u)
+          if [ -n "$bad" ]; then
+            echo "not merging: checks not green on $HEAD_SHA:"
+            echo "$bad"
+            exit 0
+          fi
+          gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$HEAD_SHA"
