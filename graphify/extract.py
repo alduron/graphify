@@ -1444,15 +1444,16 @@ def _resolve_js_import_target(raw: str, str_path: str) -> "tuple[str, Path | Non
     if not raw:
         return None
     resolved_path = _resolve_js_module_path(raw, Path(str_path).parent)
-    # Only a candidate that exists on disk is a file-level target. A missing one
-    # would mint the id of a file that is not there (file ids drop the
-    # extension), so it falls through to the external id below.
     if resolved_path is not None and resolved_path.is_file():
         return _make_id(str(resolved_path)), resolved_path
     module_name = raw.split("/")[-1]
     if not module_name:
         return None
-    return _make_id(module_name), None
+    # A candidate that does not exist on disk must not mint a file-level id: file ids
+    # drop the extension, so it would equal the id of the file that is not there. The
+    # file-level edge points at the external module id instead; the candidate path is
+    # still returned so symbol-level edges keep their stem.
+    return _make_id(module_name), resolved_path
 
 
 def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_path: str) -> None:
