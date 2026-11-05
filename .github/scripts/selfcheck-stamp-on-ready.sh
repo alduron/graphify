@@ -60,6 +60,8 @@ sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 other=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 export HEAD_SHA=$sha
 fail=0
+ran=0
+INTENDED=16
 
 mk() { # mk <label yes|no> <token approve|none|reject|botonly> [live head]
   export SIM_DIR="$work/sim"
@@ -79,6 +81,7 @@ mk() { # mk <label yes|no> <token approve|none|reject|botonly> [live head]
 
 expect() { # expect <name> <want-rc> <got-rc> <want-stamps> <want-markers>
   local s m
+  ran=$((ran + 1))
   s=$(grep -c "ap:approved-sha:$sha" "$SIM_DIR/posted.log" || true)
   m=$(grep -c "approval-stamp-missing $sha" "$SIM_DIR/posted.log" || true)
   if [ "$2" = "$3" ] && [ "$s" = "$4" ] && [ "$m" = "$5" ]; then
@@ -122,4 +125,7 @@ expect "automerge: head moves mid-wait -> exit 0, no marker" 0 "$rc" 0 0
 mk yes approve $other; rc=$(missing)
 expect "automerge: live head differs from payload -> exit 0, no marker" 0 "$rc" 0 0
 unset SIM_ON_SLEEP
+if [ "$ran" != "$INTENDED" ]; then
+  echo "FAIL ran $ran cases, intended $INTENDED"; fail=1
+fi
 exit $fail

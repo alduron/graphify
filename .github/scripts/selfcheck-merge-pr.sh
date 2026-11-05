@@ -36,6 +36,7 @@ normal="normal-token-value"
 pat="secret-pat-value"
 fail=0
 ran=0
+INTENDED=6
 
 # run_case <name> <mode> <with_pat 0|1> <live sha> <attempts> <want rc> <want merge calls> <want pat calls>
 run_case() {
@@ -77,5 +78,8 @@ run_case "fallback also refused"   refuse_all  1   "$sha"   2   1  3     1
 run_case "transient failure"       fail        1   "$sha"   2   1  2     0
 run_case "head moved"              fail        1   "$other" 3   0  1     0
 
+if [ "$ran" != "$INTENDED" ]; then
+  echo "FAIL ran $ran cases, intended $INTENDED"; fail=1
+fi
 if [ "$fail" != "0" ]; then exit 1; fi
 echo "merge-pr.sh self-check passed: all $ran cases resolved correctly"

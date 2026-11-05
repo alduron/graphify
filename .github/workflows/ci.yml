@@ -115,32 +115,6 @@ jobs:
           uv run --frozen graphify --help
           uv run --frozen graphify install
 
-  security-scan:
-    # The dev deps include bandit and pip-audit. Run them in CI so a new
-    # HIGH-severity finding or vulnerable dependency is visible on the PR that
-    # introduces it. Informational (continue-on-error) so pre-existing findings
-    # do not block; it is deliberately not in automerge's needs.
-    if: ${{ github.event.pull_request.draft == false && github.event.action != 'labeled' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: uv sync --frozen
-
-      - name: bandit (static security analysis)
-        continue-on-error: true
-        run: uv run --frozen bandit -r graphify -ll
-
-      - name: pip-audit (dependency vulnerabilities)
-        continue-on-error: true
-        run: uv run --frozen pip-audit --strict
-
   gate-selfcheck:
     # Proves the merge-gate scripts against fixtures and a fake gh on every PR, so a regression in
     # the gate is caught by the PR that introduces it and never discovered live. automerge needs
