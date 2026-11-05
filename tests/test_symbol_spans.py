@@ -160,3 +160,30 @@ def test_a_containment_cycle_terminates(tmp_path: Path) -> None:
     result["edges"].append({"source": "render", "target": "widget", "relation": "method"})
     nodes = _by_id(annotate_symbol_spans(result, path))
     assert nodes["widget"]["end_line"] >= nodes["hide"]["end_line"]
+
+
+def _node_for(path: Path, label: str, line: int) -> dict:
+    node = {"id": label, "label": label, "source_file": str(path), "source_location": f"L{line}"}
+    return annotate_symbol_spans({"nodes": [node], "edges": []}, path)["nodes"][0]
+
+
+def test_renamed_and_moved_class_keeps_name_free_digest(tmp_path: Path) -> None:
+    """A rename + move changes body_sha (the header names the class) but not body_sha_nf."""
+    body = "\n    def total(self):\n        return 42\n"
+    before = tmp_path / "billing.py"
+    before.write_text("class InvoiceCalculator:" + body, encoding="utf-8")
+    after = tmp_path / "engine.py"
+    after.write_text("import os\n\n\nclass BillingEngine:" + body, encoding="utf-8")
+
+    old = _node_for(before, "InvoiceCalculator", 1)
+    new = _node_for(after, "BillingEngine", 4)
+    assert old["body_sha"] != new["body_sha"]
+    assert old["body_sha_nf"] == new["body_sha_nf"]
+
+
+def test_name_free_digest_still_changes_when_body_changes(tmp_path: Path) -> None:
+    a = tmp_path / "a.py"
+    a.write_text("def f():\n    return 1\n", encoding="utf-8")
+    b = tmp_path / "b.py"
+    b.write_text("def g():\n    return 2\n", encoding="utf-8")
+    assert _node_for(a, "f", 1)["body_sha_nf"] != _node_for(b, "g", 1)["body_sha_nf"]
