@@ -1,11 +1,39 @@
+# CI and gated automerge for graphify (base branch v8). One workflow on purpose: the test jobs
+# and the merge gate cannot be green alone (Convention_ChangesThatCannotBeGreenAloneShipInOnePr),
+# and the merge job `needs:` the test jobs so the run that finishes last is the run that merges.
+#
+# Ported from alduron/aethergraph-cli .github/workflows/ci.yml and .github/scripts/*, adapted to
+# base v8 (Convention_GraphifyMergePathMirrorsTheGatedAutomerge). The guarantees are identical:
+#
+#   - Every billed job is gated on `draft == false`; `ready_for_review` runs the gates once.
+#   - THE VERDICT IS A SHA-BOUND TOKEN, NOT PARSED PROSE. A reviewer approves by posting a comment
+#     whose ENTIRE body is `<!-- ap:verdict-approve:<40-char head sha> -->`; a veto is the same with
+#     `verdict-reject`. Bot-authored comments never count. The label alone is never approval
+#     (Caveat_SharedGhAuthLetsAnyWorkerSelfApprove: every agent shares one gh identity).
+#   - The github-actions bot stamps `<!-- ap:approved-sha:<sha> -->` when review:approved lands with
+#     a valid token (labeled), and again on opened / reopened / ready_for_review when the label
+#     predates the event (a label applied to a draft; Caveat_ApprovalLabelOnADraftNever
+#     GetsStampedSoAutomergeSkipsSilently). A push (synchronize) strips a stale label.
+#   - automerge reads the label, the head sha and the check-runs LIVE, requires the stamp and a
+#     valid token for the live head, and merges with --squash --delete-branch --match-head-commit.
+#   - A stranded approval (label + valid token + no stamp) posts one marker comment and fails.
+#   - Never a schedule, repository_dispatch, workflow_dispatch or workflow_run trigger.
+#
+# Every `run:` below that contains ' #' sits in a block scalar (|), never a plain one-line scalar
+# (Caveat_PlainYamlRunScalarWithSpaceHashIsCutAsAComment).
 name: CI
 
 on:
-  push:
-    branches: ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "main"]
   pull_request:
-    branches: ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "main"]
-  workflow_dispatch:
+    branches: ["v8"]
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
+
+# A superseded run is cancelled instead of billing to completion. The group splits on event kind so
+# that a `labeled` run (the reviewer's approval) is never cancelled by a later push's run, and a
+# draft run (which bills nothing) never cancels the ready run that carries the gates.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.pull_request.draft && 'draft' || (github.event.action == 'labeled' && 'label' || 'default') }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/v8' }}
 
 jobs:
   skillgen-check:
@@ -14,7 +42,12 @@ jobs:
     # generated file or forgot to re-run the generator and bless expected/, and it
     # runs the build-time validators that guard per-host coverage, the file_type
     # enum, the monolith round-trips, and the always-on round-trips.
+    #
+    # Skipped on a bare `labeled` event: applying review:approved does not change the head sha, so
+    # automerge reads this sha's earlier check-run instead of paying for the job again.
+    if: ${{ github.event.pull_request.draft == false && github.event.action != 'labeled' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
@@ -47,8 +80,12 @@ jobs:
         run: uv run --frozen python -m tools.skillgen --always-on-roundtrip
 
   test:
+    if: ${{ github.event.pull_request.draft == false && github.event.action != 'labeled' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
+      # Both interpreters report, so a failure on one never hides the other's result.
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.12"]
 
@@ -80,11 +117,10 @@ jobs:
 
   security-scan:
     # The dev deps include bandit and pip-audit. Run them in CI so a new
-    # HIGH-severity finding or vulnerable dependency is caught on the PR that
-    # introduces it, rather than at the next manual audit.
-    # Non-blocking for now (continue-on-error) to avoid breaking CI on
-    # pre-existing findings; remove continue-on-error after the initial
-    # cleanup pass.
+    # HIGH-severity finding or vulnerable dependency is visible on the PR that
+    # introduces it. Informational (continue-on-error) so pre-existing findings
+    # do not block; it is deliberately not in automerge's needs.
+    if: ${{ github.event.pull_request.draft == false && github.event.action != 'labeled' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -104,3 +140,836 @@ jobs:
       - name: pip-audit (dependency vulnerabilities)
         continue-on-error: true
         run: uv run --frozen pip-audit --strict
+
+  gate-selfcheck:
+    # Proves the merge-gate scripts against fixtures and a fake gh on every PR, so a regression in
+    # the gate is caught by the PR that introduces it and never discovered live. automerge needs
+    # this job: a gate that cannot prove itself does not merge.
+    if: ${{ github.event.pull_request.draft == false && github.event.action != 'labeled' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Self-check the verdict-approval token match
+        # --- verdict-approve-token-matches.sh / verdict-reject-token-matches.sh self-check ---
+        # Exercises both token-matcher scripts -- the exact scripts approval-gate's verdict
+        # check and automerge's live check both call to decide whether an approve token for the
+        # live head exists with no reject token for it -- against fixtures, on every PR. Runs
+        # unconditionally, same discipline as the approval-stamp self-check below, so a logic
+        # regression here is caught by the PR that introduces it, never discovered live.
+        #
+        # REPLACES the prior "11 fixture cases" self-check against the first cut of
+        # verdict-approve-token-matches.sh, which matched the token as a SUBSTRING of the raw,
+        # concatenated comment stream (Decision_VerdictTokenIsWholeCommentBodyNotSubstring). That
+        # design manufactured its own bypass: this workflow's own auto-posted rejection message
+        # used to print the required token with the LIVE head sha already interpolated (it had
+        # to, to show the format), so the bot's own "here is the format" message was itself a
+        # valid approval the instant it posted; the same substring match let explicit rejection
+        # prose quoting the token format ("Do NOT post <!-- ... --> until fixed") resolve as an
+        # approval too. Both close at the root once a comment only counts when its ENTIRE body,
+        # nothing more, is the token -- see verdict-approve-token-matches.sh's own header for the
+        # full account, including why this DELIBERATELY REVERSES the earlier design's choice to
+        # let a blockquoted or fenced token count.
+        #
+        # This also adds the explicit veto that design was missing
+        # (Decision_VerdictRejectTokenIsAnExplicitMonotonicVeto): a SECOND, independent reviewer
+        # who finds a real blocker after a first reviewer's honest approval had no mechanical
+        # lever at all -- prose has zero effect by design -- so a stale approval stayed live
+        # through every later automerge run no matter what anyone wrote afterward.
+        # verdict-reject-token-matches.sh is that lever: a reject token for the live head blocks
+        # the merge, in either posting order, regardless of any approve token also present for
+        # that same head -- see that script's own header for the monotonicity and staleness
+        # argument.
+        #
+        # 33 fixture cases across five groups:
+        #   Group 1 (14 cases), the approve matcher must BLOCK: the bot's own rejection message
+        #   with a live token embedded in a longer, multi-line body; explicit-rejection prose
+        #   quoting the token format; a blockquoted token; a fenced token; a token with extra text
+        #   before or after it in the SAME comment; two ADJACENT comments whose raw concatenation
+        #   would form the token even though neither comment alone is one (the proof that
+        #   per-comment boundaries, not a concatenated stream, decide this); a token bound to a
+        #   stale sha; a wrong-prefix, truncated, wrong-case, or mistyped-prefix token; no token
+        #   at all; and ordinary prose with no token anywhere.
+        #   Group 2 (5 cases), the approve matcher must ALLOW: a comment whose entire body is the
+        #   live-head token, alone; the same with surrounding whitespace or a trailing newline;
+        #   that case while OTHER comments merely mention the token format in prose; and the same
+        #   token whose base64 WIRE LINE carries a stray trailing CR (a Windows-style line ending
+        #   some jq build or runner could introduce) -- proving the scripts tolerate CRLF on the
+        #   base64 stream itself, not just inside the decoded body.
+        #   Group 3 (4 cases), the reject matcher, mirroring group 2's shape for the reject token
+        #   (present/absent, stale-sha does not count).
+        #   Group 4 (5 cases), the COMBINED gate decision (approve AND NOT reject, exactly what
+        #   approval-gate and automerge each compute): approve-then-reject and
+        #   reject-then-approve for the SAME live head both BLOCK (the order-independence proof --
+        #   neither check infers anything from which comment landed first); approve for the live
+        #   head with a reject only on a different, stale sha ALLOWS (staleness is structural,
+        #   same as the approve matcher's own staleness guarantee); approve alone ALLOWS; reject
+        #   alone BLOCKS.
+        #   Group 5 (5 cases), LOCALE DETERMINISM: the same body run through the approve matcher
+        #   under LC_ALL=C and again under LC_ALL=C.utf8 must resolve to the SAME verdict both
+        #   times -- the property an independent reviewer found untested, since the trim
+        #   previously used bash's "[:space:]" class, whose membership bash resolves via the
+        #   active locale's iswspace() table rather than a fixed alphabet. A bare token (no
+        #   trailing whitespace at all); a trailing ASCII tab; a trailing newline -- all three
+        #   ALLOW in every locale, because plain ASCII whitespace is whitespace under C as much
+        #   as under any UTF-8 locale. A trailing U+00A0 NO-BREAK SPACE BLOCKS in every locale
+        #   now: under en_US.UTF-8 or C.utf8 (Unicode's White_Space property reaches past ASCII
+        #   there) that byte used to trim away and ALLOW, while under C/POSIX it never did, which
+        #   is the exact split this group proves closed. A trailing U+200B ZERO WIDTH SPACE
+        #   BLOCKS in every locale, unchanged by the fix -- it is Unicode category Cf (format),
+        #   never whitespace to iswspace under any locale, so it was already content everywhere;
+        #   kept as a determinism control alongside the NBSP case, not because it was ever the
+        #   bug.
+        #
+        # RETRACTION NOTE (see verdict-reject-token-matches.sh's own header for the full
+        # account): nothing in this fixture set exercises "a reviewer posted a token, then
+        # changed their mind on the same head" for either token -- that case is deliberately not
+        # something either script can see. It is handled, if at all, by editing or deleting the
+        # stale comment on GitHub, which removes the token from what these scripts read on their
+        # NEXT invocation -- a VISIBLE action, not a silent one, but NOT an identity-checked one
+        # either: every agent and the owner authenticate to GitHub as the same login
+        # (Caveat_SharedGhAuthLetsAnyWorkerSelfApprove), so "their own stale comment" is not a
+        # real distinction and this does NOT structurally stop a self-approving actor from
+        # deleting a reject token cast against their own diff. Closing that for real needs a
+        # reviewer credential distinct from the author's, an infrastructure decision outside what
+        # either script can enforce.
+        #
+        # Every multi-comment fixture below is built with the comments() helper, which
+        # base64-encodes EACH argument as its own line -- the same wire format the live `gh pr
+        # view --jq '.comments[] | select(...) | .body | @base64'` calls elsewhere in this file
+        # produce -- rather than a literal embedded line break, so a comment's own internal
+        # newlines can never be mistaken for a boundary between two different comments (see the
+        # adjacent-comment case in group 1 above).
+        #
+        # The harness asserts the number of cases it actually ran against the number it was written
+        # to run before printing any pass/fail summary, same discipline as the approval-stamp
+        # self-check below (Convention_AVerificationHarnessMustAssertHowManyCasesItRan).
+        run: |
+          set -euo pipefail
+          approve_script=".github/scripts/verdict-approve-token-matches.sh"
+          reject_script=".github/scripts/verdict-reject-token-matches.sh"
+          sha_live="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          sha_old="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          sha_truncated="${sha_live%?}"
+          sha_upper="${sha_live^^}"
+          INTENDED=33
+          ran=0
+          fail=0
+
+          # Base64-encodes EACH argument as its own line, simulating
+          # `gh pr view --json comments --jq '.comments[] | .body | @base64'` for N separate
+          # comments -- never a literal embedded newline, which would make two adjacent comments
+          # indistinguishable from one multi-line comment.
+          comments() {
+            local out="" first=1 c enc
+            for c in "$@"; do
+              enc=$(printf '%s' "$c" | base64 | tr -d '\n')
+              if [ "$first" -eq 1 ]; then out="$enc"; first=0; else out="$out"$'\n'"$enc"; fi
+            done
+            printf '%s' "$out"
+          }
+
+          check_approve() {
+            ran=$((ran+1))
+            if printf '%s\n' "$1" | bash "$approve_script" "$sha_live"; then got=ALLOWED; else got=BLOCKED; fi
+            if [ "$got" != "$2" ]; then
+              echo "FAIL [approve: $3]: expected $2, got $got. input=[$1]"
+              fail=1
+            fi
+          }
+
+          check_reject() {
+            ran=$((ran+1))
+            if printf '%s\n' "$1" | bash "$reject_script" "$sha_live"; then got=PRESENT; else got=ABSENT; fi
+            if [ "$got" != "$2" ]; then
+              echo "FAIL [reject: $3]: expected $2, got $got. input=[$1]"
+              fail=1
+            fi
+          }
+
+          check_combo() {
+            ran=$((ran+1))
+            if printf '%s\n' "$1" | bash "$approve_script" "$sha_live" \
+                 && ! printf '%s\n' "$1" | bash "$reject_script" "$sha_live"; then
+              got=ALLOWED
+            else
+              got=BLOCKED
+            fi
+            if [ "$got" != "$2" ]; then
+              echo "FAIL [combo: $3]: expected $2, got $got. input=[$1]"
+              fail=1
+            fi
+          }
+
+          bot_rejection_message=$(printf '%s\n' \
+            "**review:approved rejected: no verdict-approval token for the live head.**" \
+            "" \
+            "The actor who applied this label is the same login as this PR's author, so" \
+            "automerge requires a comment on this PR containing the literal token:" \
+            "" \
+            "    <!-- ap:verdict-approve:$sha_live -->" \
+            "" \
+            "None was found. Post the exact token above.")
+          check_approve "$(comments "$bot_rejection_message")" BLOCKED "bot's own full rejection message, with a live token embedded in a longer multi-line body"
+
+          explicit_rejection="I am REJECTING this. Do NOT post <!-- ap:verdict-approve:$sha_live --> until the blocker is fixed."
+          check_approve "$(comments "$explicit_rejection")" BLOCKED "explicit-rejection prose that quotes the token format"
+
+          check_approve "$(comments "> <!-- ap:verdict-approve:$sha_live -->")" BLOCKED "blockquoted token (body is the blockquote, not the bare token)"
+
+          fenced=$(printf '```\n<!-- ap:verdict-approve:%s -->\n```' "$sha_live")
+          check_approve "$(comments "$fenced")" BLOCKED "fenced token (body is a fenced block, not the bare token)"
+
+          check_approve "$(comments "<!-- ap:verdict-approve:$sha_live --> lgtm")" BLOCKED "extra text AFTER the token in the same comment body"
+          check_approve "$(comments "lgtm <!-- ap:verdict-approve:$sha_live -->")" BLOCKED "extra text BEFORE the token in the same comment body"
+
+          check_approve "$(comments "<!-- ap:verdict-appro" "ve:$sha_live -->")" BLOCKED "two adjacent comments whose raw concatenation forms a token, but neither comment alone is"
+
+          check_approve "$(comments "<!-- ap:verdict-approve:$sha_old -->")" BLOCKED "token bound to a stale sha only"
+          check_approve "$(comments "<!-- ap:verdict-approved:$sha_live -->")" BLOCKED "wrong prefix (ap:verdict-approved, not ap:verdict-approve)"
+          check_approve "$(comments "<!-- ap:verdict-approve:$sha_truncated -->")" BLOCKED "truncated sha (39 hex characters)"
+          check_approve "$(comments "<!-- ap:verdict-approve:$sha_upper -->")" BLOCKED "wrong-case sha"
+          check_approve "$(comments "<!-- apx:verdict-approve:$sha_live -->")" BLOCKED "mistyped prefix (apx instead of ap)"
+          check_approve "$(comments)" BLOCKED "no comments at all, so no token"
+          check_approve "$(comments "Looks fine overall, nice work.")" BLOCKED "ordinary findings prose with no token anywhere"
+
+          check_approve "$(comments "<!-- ap:verdict-approve:$sha_live -->")" ALLOWED "a comment whose entire body is the live-head token, alone"
+          check_approve "$(comments $'\n  <!-- ap:verdict-approve:'"$sha_live"$' -->  \n')" ALLOWED "same, with surrounding whitespace / blank lines"
+          check_approve "$(printf '%s' "<!-- ap:verdict-approve:$sha_live -->" | base64 | tr -d '\n')" ALLOWED "same with a literal trailing newline, as a real comment body would have"
+          approve_token_b64=$(printf '%s' "<!-- ap:verdict-approve:$sha_live -->" | base64 | tr -d '\n')
+          cr=$'\r'
+          check_approve "${approve_token_b64}${cr}" ALLOWED "the base64 wire line itself carries a stray trailing CR (CRLF transport)"
+          check_approve "$(comments "<!-- ap:verdict-approve:$sha_live -->" "mentions the <!-- ap:verdict-approve:$sha_live --> format in prose, but is a DIFFERENT comment")" ALLOWED "exact token present while OTHER comments merely mention the token format"
+
+          check_reject "$(comments "<!-- ap:verdict-reject:$sha_live -->")" PRESENT "exact reject token for the live head, alone"
+          check_reject "$(comments "<!-- ap:verdict-reject:$sha_old -->")" ABSENT "reject token bound to a stale sha only"
+          check_reject "$(comments "nothing to see here")" ABSENT "no reject token at all"
+          check_reject "$(comments "> <!-- ap:verdict-reject:$sha_live -->")" ABSENT "blockquoted reject token does not count either"
+
+          check_combo "$(comments "<!-- ap:verdict-approve:$sha_live -->" "<!-- ap:verdict-reject:$sha_live -->")" BLOCKED "approve then reject, same live head"
+          check_combo "$(comments "<!-- ap:verdict-reject:$sha_live -->" "<!-- ap:verdict-approve:$sha_live -->")" BLOCKED "reject then approve, same live head (order must not matter)"
+          check_combo "$(comments "<!-- ap:verdict-approve:$sha_live -->" "<!-- ap:verdict-reject:$sha_old -->")" ALLOWED "approve for the live head, reject only for a different (stale) sha"
+          check_combo "$(comments "<!-- ap:verdict-approve:$sha_live -->")" ALLOWED "approve only, no reject at all"
+          check_combo "$(comments "<!-- ap:verdict-reject:$sha_live -->")" BLOCKED "reject only, no approve at all"
+
+          # Group 5, locale determinism: runs the SAME body through the approve matcher under
+          # LC_ALL=C and LC_ALL=C.utf8 and asserts both locales agree, both with each other and
+          # with the expected verdict. C.utf8 is glibc's built-in UTF-8 locale (no localedef
+          # needed), present on ubuntu-latest by default -- the same realistic UTF-8 default an
+          # independent reviewer measured this bug against.
+          check_locale_determinism() {
+            ran=$((ran+1))
+            local body="$1" expected="$2" desc="$3" c_got utf8_got
+            if printf '%s\n' "$body" | LC_ALL=C bash "$approve_script" "$sha_live"; then c_got=ALLOWED; else c_got=BLOCKED; fi
+            if printf '%s\n' "$body" | LC_ALL=C.utf8 bash "$approve_script" "$sha_live"; then utf8_got=ALLOWED; else utf8_got=BLOCKED; fi
+            if [ "$c_got" != "$utf8_got" ]; then
+              echo "FAIL [determinism: $desc]: C gave $c_got, C.utf8 gave $utf8_got -- verdict depends on locale"
+              fail=1
+            elif [ "$c_got" != "$expected" ]; then
+              echo "FAIL [determinism: $desc]: expected $expected in both locales, got $c_got in both"
+              fail=1
+            fi
+          }
+
+          nbsp=$(printf '\xc2\xa0')      # U+00A0 NO-BREAK SPACE, UTF-8 encoded
+          zwsp=$(printf '\xe2\x80\x8b')  # U+200B ZERO WIDTH SPACE, UTF-8 encoded
+
+          check_locale_determinism "$(comments "<!-- ap:verdict-approve:$sha_live -->")" ALLOWED \
+            "bare token, no trailing whitespace at all"
+          check_locale_determinism "$(comments "<!-- ap:verdict-approve:$sha_live -->"$'\t')" ALLOWED \
+            "trailing ASCII tab -- whitespace under C as much as under any UTF-8 locale"
+          check_locale_determinism "$(comments "<!-- ap:verdict-approve:$sha_live -->"$'\n')" ALLOWED \
+            "trailing newline -- whitespace under C as much as under any UTF-8 locale"
+          check_locale_determinism "$(comments "<!-- ap:verdict-approve:$sha_live -->${nbsp}")" BLOCKED \
+            "trailing NBSP -- used to ALLOW under en_US.UTF-8/C.utf8 only; now content in every locale"
+          check_locale_determinism "$(comments "<!-- ap:verdict-approve:$sha_live -->${zwsp}")" BLOCKED \
+            "trailing ZWSP -- never whitespace to iswspace in any locale; determinism control"
+
+          echo "executed $ran of $INTENDED intended cases"
+          if [ "$ran" -ne "$INTENDED" ]; then
+            echo "FAIL: executed case count ($ran) does not match the intended count ($INTENDED) -- a case was silently dropped"
+            exit 1
+          fi
+          if [ "$fail" -ne 0 ]; then
+            echo "FAIL: one or more verdict-token fixture cases resolved incorrectly (see above)"
+            exit 1
+          fi
+          echo "verdict-token self-check passed: all $ran cases resolved correctly"
+
+      - name: Self-check latest-check-run.sh
+        # Exercises .github/scripts/latest-check-run.sh -- the exact script automerge's "Resolve
+        # live check state for the head sha" step calls once this run's own result for a job is a
+        # cascade skip -- against fixtures, on every PR. This is the function that produced TWO
+        # live bugs in one PR review cycle (a per-page jq aggregate dropping every page but the
+        # first, and a cascade-skip self-poisoning that a run-id-only exclusion missed), both
+        # caught by reading, not by a test, while its siblings above already had self-checks.
+        # Runs unconditionally, same discipline as those siblings.
+        #
+        # Fixtures are built with jq -n, matching the exact shape `gh api ... --paginate --slurp`
+        # hands the script: an ARRAY OF PAGES, each page an object carrying a .check_runs array.
+        # Every case asks for job name "job"; the multi-page case also carries decoy "other-job"
+        # entries at higher ids, which proves the name filter rather than merely the newest-wins
+        # logic.
+        #
+        # The harness asserts the number of cases it actually ran against the number it was
+        # written to run before printing any pass/fail summary, same discipline as the
+        # verdict-token self-check above (Convention_AVerificationHarnessMustAssertHowManyCasesItRan).
+        run: |
+          set -euo pipefail
+          script=".github/scripts/latest-check-run.sh"
+          INTENDED=7
+          ran=0
+          fail=0
+
+          run_case() {
+            ran=$((ran+1))
+            local pages="$1" expected="$2" desc="$3" got
+            got=$(printf '%s' "$pages" | bash "$script" "job") || {
+              echo "FAIL [$desc]: script exited nonzero, expected output '$expected'"
+              fail=1
+              return
+            }
+            if [ "$got" != "$expected" ]; then
+              echo "FAIL [$desc]: expected '$expected', got '$got'"
+              fail=1
+            fi
+          }
+
+          run_error_case() {
+            ran=$((ran+1))
+            local input="$1" desc="$2"
+            if printf '%s' "$input" | bash "$script" "job" >/dev/null 2>&1; then
+              echo "FAIL [$desc]: script exited 0 on malformed input, so an upstream gh api error would be misread as a resolved state instead of forcing the caller's query-error/pending path"
+              fail=1
+            fi
+          }
+
+          pages_success_then_skip=$(jq -n '[
+            {check_runs: [
+              {id: 1, name: "job", status: "completed", conclusion: "success"},
+              {id: 2, name: "job", status: "completed", conclusion: "skipped"}
+            ]}
+          ]')
+          run_case "$pages_success_then_skip" "completed success" \
+            "[success, skip] resolves to the success, not the newer skip -- also proves a run-id exclusion is unnecessary: the higher-id skip here is exactly what a real calling run's own cascade-skip entry looks like, and the skip filter alone discards it with no run-id parameter at all"
+
+          pages_success_then_two_skips=$(jq -n '[
+            {check_runs: [
+              {id: 1, name: "job", status: "completed", conclusion: "success"},
+              {id: 2, name: "job", status: "completed", conclusion: "skipped"},
+              {id: 3, name: "job", status: "completed", conclusion: "skipped"}
+            ]}
+          ]')
+          run_case "$pages_success_then_two_skips" "completed success" \
+            "[success, skip, skip] resolves to the success through two stacked skips"
+
+          pages_failure_then_skips=$(jq -n '[
+            {check_runs: [
+              {id: 1, name: "job", status: "completed", conclusion: "failure"},
+              {id: 2, name: "job", status: "completed", conclusion: "skipped"},
+              {id: 3, name: "job", status: "completed", conclusion: "skipped"}
+            ]}
+          ]')
+          run_case "$pages_failure_then_skips" "completed failure" \
+            "a real failure is never hidden behind any number of later skips"
+
+          pages_cancelled=$(jq -n '[
+            {check_runs: [
+              {id: 1, name: "job", status: "completed", conclusion: "cancelled"}
+            ]}
+          ]')
+          run_case "$pages_cancelled" "completed cancelled" \
+            "cancelled is NOT treated as skipped -- it must surface as cancelled, not resolve absent"
+
+          run_case "[]" "absent absent" \
+            "a slurped empty page array resolves to absent, never a false ok"
+
+          pages_multi=$(jq -n '[
+            {check_runs: [
+              {id: 1, name: "job", status: "completed", conclusion: "skipped"},
+              {id: 2, name: "other-job", status: "completed", conclusion: "success"}
+            ]},
+            {check_runs: [
+              {id: 3, name: "job", status: "completed", conclusion: "failure"},
+              {id: 4, name: "other-job", status: "completed", conclusion: "failure"}
+            ]},
+            {check_runs: [
+              {id: 5, name: "job", status: "completed", conclusion: "success"},
+              {id: 6, name: "other-job", status: "completed", conclusion: "skipped"}
+            ]}
+          ]')
+          run_case "$pages_multi" "completed success" \
+            "a multi-page response (per_page=2 shape, three pages) resolves to the GLOBAL newest -- id 5's success on page three -- not a per-page aggregate that would stop at page one's id-1 skip or page two's id-3 failure; the other-job entries at higher ids than some job entries prove the name filter, not just newest-wins"
+
+          run_error_case '{not valid json' \
+            "malformed JSON input, simulating an upstream gh api error reaching the script, exits nonzero rather than printing a state that could be misread as ok"
+
+          echo "executed $ran of $INTENDED intended cases"
+          if [ "$ran" -ne "$INTENDED" ]; then
+            echo "FAIL: executed case count ($ran) does not match the intended count ($INTENDED) -- a case was silently dropped"
+            exit 1
+          fi
+          if [ "$fail" -ne 0 ]; then
+            echo "FAIL: one or more latest-check-run.sh fixture cases resolved incorrectly (see above)"
+            exit 1
+          fi
+          echo "latest-check-run.sh self-check passed: all $ran cases resolved correctly"
+
+      - name: Self-check the approval-stamp match
+        # Ported from the former test-approval-stamp-match job (folded in here for cost -- see the
+        # top-of-file comment). Exercises .github/scripts/approval-stamp-matches.sh - the exact
+        # script automerge calls to decide whether review:approved is backed by a real,
+        # sha-matching verdict - against fixtures, on every PR. Without this, a logic regression
+        # there (the cut -d:-f2 bug this replaced, which always failed closed and silently stopped
+        # automerge from ever merging anything, in either direction) only shows up on a LATER
+        # labeled event with nothing in CI to catch it: a workflow-only diff that breaks this line
+        # still shows all-green on the PR that introduces it. Runs unconditionally so it is never
+        # skipped by an unrelated red check.
+        run: |
+          set -euo pipefail
+          script=".github/scripts/approval-stamp-matches.sh"
+          sha_a="1111111111111111111111111111111111111111"
+          sha_b="2222222222222222222222222222222222222222"
+
+          if ! printf '%s\n' "<!-- ap:approved-sha:$sha_a -->" | bash "$script" "$sha_a"; then
+            echo "FAIL: a stamp for the live head was not recognized"; exit 1
+          fi
+          if printf '%s\n' "<!-- ap:approved-sha:$sha_a -->" | bash "$script" "$sha_b"; then
+            echo "FAIL: a stamp for a DIFFERENT commit was wrongly accepted"; exit 1
+          fi
+          if printf '%s\n' "no marker here" | bash "$script" "$sha_a"; then
+            echo "FAIL: a comment with no marker was wrongly accepted"; exit 1
+          fi
+          if printf '%s\n' "" | bash "$script" "$sha_a"; then
+            echo "FAIL: no comments at all was wrongly accepted"; exit 1
+          fi
+          echo "approval-stamp match self-check passed"
+
+      - name: Self-check the author filter against a realistic comments payload
+        # The body-matching checks above prove the grep works on text handed to it directly, but
+        # nothing proved .github/scripts/select-approval-comments.jq actually SELECTS the right
+        # comments out of a real `gh pr view --json comments` shape - that selector is where the
+        # real bug was: it matched only the "github-actions[bot]" login, but gh's GraphQL comments
+        # field reports this bot's login as plain "github-actions" with no "[bot]" suffix, so the
+        # candidate list was always empty and automerge always skipped (caught live on umbrella
+        # PR 377, after a real label). This fixture carries BOTH spellings plus a human login, so
+        # a regression on either match or on the author restriction itself fails loudly here.
+        run: |
+          set -euo pipefail
+          sha_a="3333333333333333333333333333333333333333"
+          sha_b="4444444444444444444444444444444444444444"
+          sha_c="5555555555555555555555555555555555555555"
+          # Built with jq -n rather than a hand-quoted heredoc, so the fixture itself cannot
+          # carry a JSON-escaping bug that masks the thing being tested.
+          fixture="$RUNNER_TEMP/fixture-comments.json"
+          jq -n --arg a "$sha_a" --arg b "$sha_b" --arg c "$sha_c" '
+            {comments: [
+              {author: {login: "github-actions"}, body: ("<!-- ap:approved-sha:" + $a + " -->")},
+              {author: {login: "github-actions[bot]"}, body: ("<!-- ap:approved-sha:" + $b + " -->")},
+              {author: {login: "someone-with-write-access"}, body: ("<!-- ap:approved-sha:" + $c + " -->")}
+            ]}' > "$fixture"
+
+          selected=$(jq -r -f .github/scripts/select-approval-comments.jq "$fixture")
+
+          if ! printf '%s\n' "$selected" | bash .github/scripts/approval-stamp-matches.sh "$sha_a"; then
+            echo "FAIL: the GraphQL-spelling bot comment (login=github-actions) was not selected"; exit 1
+          fi
+          if ! printf '%s\n' "$selected" | bash .github/scripts/approval-stamp-matches.sh "$sha_b"; then
+            echo "FAIL: the REST-spelling bot comment (login=github-actions[bot]) was not selected"; exit 1
+          fi
+          if printf '%s\n' "$selected" | bash .github/scripts/approval-stamp-matches.sh "$sha_c"; then
+            echo "FAIL: a non-bot-authored stamp was wrongly accepted"; exit 1
+          fi
+          echo "author-filter self-check passed"
+
+      - name: Self-check the stamp-on-ready and missing-stamp scripts
+        run: bash .github/scripts/selfcheck-stamp-on-ready.sh
+
+      - name: Self-check the merge step (workflows-permission fallback)
+        run: bash .github/scripts/selfcheck-merge-pr.sh
+
+  approval-gate:
+    # Stamps the exact head sha an approval covers, and drops a stale approval on a new push.
+    # The verdict-token check runs FIRST on a labeled event, so a label without a valid
+    # sha-bound token for the live head never reaches the stamp. It exits 0 on rejection (a
+    # pending human step is not a broken build) after stripping the label and explaining; automerge
+    # never trusts this job's result and re-derives the same token check live.
+    #
+    # An approval that predates the event: review:approved applied while the PR was a draft never
+    # reached the labeled path (draft == false), so a non-draft opened / reopened / ready_for_review
+    # event whose PR already carries the label also runs this job, for the "Stamp an approval that
+    # predates this event" step only. The payload label list is a cheap pre-filter; the step reads
+    # the label LIVE.
+    if: >-
+      github.event_name == 'pull_request' && github.event.pull_request.draft == false &&
+      ((github.event.action == 'labeled' && github.event.label.name == 'review:approved') ||
+       github.event.action == 'synchronize' ||
+       (contains(fromJSON('["opened","reopened","ready_for_review"]'), github.event.action) &&
+        contains(github.event.pull_request.labels.*.name, 'review:approved')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # Only the labeled and ready paths read .github/scripts/*; the synchronize path makes one
+      # API call and needs no checkout.
+      - uses: actions/checkout@v6
+        if: ${{ github.event.action != 'synchronize' }}
+      - name: Require a verdict-approval token when the labeler is the PR author
+        if: ${{ github.event.action == 'labeled' }}
+        id: verdict-check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.event.sender.login }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$ACTOR" != "$AUTHOR" ]; then
+            echo "labeled by $ACTOR, authored by $AUTHOR: distinct actor, no verdict required."
+            echo "verdict_ok=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "labeled by $ACTOR, same login as the PR author: requiring a verdict-approval token for $HEAD_SHA."
+          # Whole-body token plus the explicit veto; bot-authored comments are excluded from both.
+          gh pr view "$PR" --repo "$REPO" --json comments \
+               --jq '.comments[] | select(.author.login | test("^github-actions(\\[bot\\])?$") | not) | .body | @base64' \
+               > "$RUNNER_TEMP/verdict-comments.b64"
+          approve_ok=1
+          if ! bash .github/scripts/verdict-approve-token-matches.sh "$HEAD_SHA" < "$RUNNER_TEMP/verdict-comments.b64"; then
+            approve_ok=0
+          fi
+          reject_present=0
+          if bash .github/scripts/verdict-reject-token-matches.sh "$HEAD_SHA" < "$RUNNER_TEMP/verdict-comments.b64"; then
+            reject_present=1
+          fi
+          if [ "$approve_ok" = "1" ] && [ "$reject_present" = "0" ]; then
+            echo "a verdict-approval token for the live head exists, with no reject token for it; allowing."
+            echo "verdict_ok=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$(gh pr view "$PR" --repo "$REPO" --json labels --jq 'any(.labels[].name; . == "review:approved")')" = "true" ]; then
+            gh pr edit "$PR" --repo "$REPO" --remove-label review:approved
+          fi
+          {
+            echo "**review:approved rejected: verdict-approval token check failed for the live head.**"
+            echo ""
+            echo "The actor who applied this label (\`$ACTOR\`) is the same login as this PR's"
+            echo "author, so automerge requires PROOF via a sha-bound comment token, not prose."
+            echo ""
+            echo "To APPROVE, post a comment whose ENTIRE body -- after trimming leading/trailing"
+            echo "whitespace, nothing else anywhere in the body -- is exactly:"
+            echo ""
+            echo "    <!-- ap:verdict-approve:<head-sha> -->"
+            echo ""
+            echo "A second, independent reviewer can VETO this outright -- in either posting order,"
+            echo "regardless of any approve token already present -- by posting a comment whose"
+            echo "entire body is exactly:"
+            echo ""
+            echo "    <!-- ap:verdict-reject:<head-sha> -->"
+            echo ""
+            echo "In both cases replace <head-sha> with this PR's CURRENT head commit, $HEAD_SHA --"
+            echo "read from \`gh pr view $PR --json headRefOid\`, never copied out of an automated"
+            echo "comment (this one included). A token wrapped in prose, a blockquote, or a fenced"
+            echo "code block does not count either way; put findings in a separate comment."
+            echo ""
+            echo "Next step: obtain (or address) an independent reviewer verdict -- a review pass"
+            echo "that posts the approve token above for this exact head, with no reject token also"
+            echo "live for it -- then re-apply review:approved."
+          } > "$RUNNER_TEMP/no-preceding-verdict.md"
+          gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/no-preceding-verdict.md"
+          echo "verdict-approval token check failed for $HEAD_SHA on PR #$PR; label stripped."
+          # exit 0: a missing verdict token is a pending human step, not a broken build.
+          echo "verdict_ok=false" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Record the sha this approval covers
+        # Gated on the prior step's OUTPUT, not its exit code (it always exits 0), so a rejected
+        # label never stamps a sha that was not approved.
+        if: ${{ github.event.action == 'labeled' && steps.verdict-check.outputs.verdict_ok == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          gh pr comment "$PR" --repo "$REPO" --body "<!-- ap:approved-sha:$HEAD_SHA -->"
+
+      - name: Stamp an approval that predates this event
+        # The labeled path above, for a label already on the PR (applied while it was a draft).
+        # Same live verdict-token check, same bot stamp; see the script header. automerge
+        # needs: this job, so it reads the stamp only after this step finishes.
+        if: ${{ contains(fromJSON('["opened","reopened","ready_for_review"]'), github.event.action) }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash .github/scripts/stamp-ready-approval.sh
+
+      - name: Drop review:approved on the new push
+        # A later push does not clear review:approved by itself. Stripping it is the user-visible
+        # half of the fix; the actual gate is automerge's sha-bound stamp and token check.
+        if: ${{ github.event.action == 'synchronize' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh pr view "$PR" --repo "$REPO" --json labels --jq 'any(.labels[].name; . == "review:approved")')" = "true" ]; then
+            gh pr edit "$PR" --repo "$REPO" --remove-label review:approved
+            echo "removed stale review:approved from PR #$PR; new head is unreviewed"
+          fi
+
+  automerge:
+    # Squash-merges a green, conflict-free PR into v8 once it carries review:approved, a bot stamp
+    # and a sha-bound verdict token for the LIVE head. `needs:` the test jobs, so the run that
+    # finishes last (this one, or the labeled run) is the run that merges; the label is read live.
+    #
+    # always() because approval-gate legitimately SKIPS on events it has no step for, and a skipped
+    # need would otherwise skip this job; the needed checks are therefore examined by name below,
+    # so a red check still blocks the merge exactly as before.
+    needs: [skillgen-check, test, gate-selfcheck, approval-gate]
+    if: >-
+      always() && github.event_name == 'pull_request' && github.base_ref == 'v8' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      # checks: read is REQUIRED by the live-checks step's check-runs query; a job-level block
+      # REPLACES the default, so all three scopes are spelled out.
+      checks: read
+    steps:
+      - name: Read review:approved live
+        id: label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          approved=false
+          if labels=$(gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name' 2>&1); then
+            if printf '%s\n' "$labels" | grep -qxF 'review:approved'; then
+              approved=true
+            fi
+          else
+            echo "FAILED to read labels for PR #$PR: $labels"
+          fi
+          echo "approved=$approved" >> "$GITHUB_OUTPUT"
+
+      # Needed for the .github/scripts/ helpers the merge step runs.
+      - uses: actions/checkout@v6
+        if: ${{ steps.label.outputs.approved == 'true' }}
+
+      - name: Resolve live check state for the head sha
+        # TRI-STATE output (ok / blocked / pending). On an ordinary event the test jobs ran IN THIS
+        # run and needs.*.result is faithful. On a `labeled` event they are deliberately skipped in
+        # this run (applying the label does not change the head), so their state is read from the
+        # check-runs API for this exact sha. A check still in flight is neither a pass nor a
+        # failure: pending merges nothing and announces no block; the run still in flight merges
+        # when it finishes. A check-runs query is retried (4 tries, 5s/10s/20s) because a one-off
+        # HTTP 500 read as pending stranded an approved green PR (cli PR 503); a query that fails
+        # every try still lands in pending, never ok.
+        id: live-checks
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_ACTION: ${{ github.event.action }}
+          SKILLGEN_RESULT: ${{ needs.skillgen-check.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          SELFCHECK_RESULT: ${{ needs.gate-selfcheck.result }}
+        run: |
+          set -uo pipefail
+
+          # Prints "<status> <conclusion>" for the most recent non-skipped check-run named $1
+          # against $HEAD_SHA, or "absent absent" (see latest-check-run.sh).
+          latest_check_run() {
+            local job_name="$1" out delay
+            for delay in 5 10 20 0; do
+              if out=$( { gh api "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" --paginate --slurp \
+                  | bash .github/scripts/latest-check-run.sh "$job_name"; } 2>&1 ); then
+                printf '%s\n' "$out"
+                return 0
+              fi
+              [ "$delay" -gt 0 ] && sleep "$delay"
+            done
+            printf '%s\n' "$out"
+            return 1
+          }
+
+          checks_state=ok
+          if [ "$EVENT_ACTION" != "labeled" ]; then
+            for r in "$SKILLGEN_RESULT" "$TEST_RESULT" "$SELFCHECK_RESULT"; do
+              if [ "$r" = "failure" ]; then
+                checks_state=blocked
+              elif [ "$r" != "success" ] && [ "$checks_state" != "blocked" ]; then
+                echo "a required job result in this run is '$r' (event action '$EVENT_ACTION'); treating as pending."
+                checks_state=pending
+              fi
+            done
+          else
+            echo "required jobs skipped in this run (expected on a labeled event); checking the most recent check-runs for $HEAD_SHA."
+            for name in "skillgen-check" "test (3.10)" "test (3.12)" "gate-selfcheck"; do
+              if row=$(latest_check_run "$name" 2>&1); then
+                read -r cstatus cconclusion <<< "$row"
+              else
+                echo "FAILED to query check-runs for $HEAD_SHA: $row"
+                cstatus=query-error
+                cconclusion=query-error
+              fi
+              if [ "$cstatus" = "completed" ] && [ "$cconclusion" = "success" ]; then
+                echo "$name: success"
+              elif [ "$cstatus" = "completed" ]; then
+                echo "$name: $cconclusion"
+                checks_state=blocked
+              else
+                echo "$name check-run state is '$cstatus' (conclusion '$cconclusion'); treating as pending."
+                if [ "$checks_state" != "blocked" ]; then checks_state=pending; fi
+              fi
+            done
+          fi
+          echo "checks_state=$checks_state" >> "$GITHUB_OUTPUT"
+
+      - name: Squash-merge when mergeable
+        if: ${{ steps.label.outputs.approved == 'true' && steps.live-checks.outputs.checks_state == 'ok' && needs.approval-gate.result != 'failure' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Fallback used once, and only when the merge is refused for lack of workflows permission
+          # (a PR touching .github/workflows while behind base; Caveat_AppMergeOfABehindWorkflowPr
+          # IsRefusedWithoutWorkflowsPermission). The value is never printed.
+          AUTOMERGE_WORKFLOW_PAT: ${{ secrets.AUTOMERGE_WORKFLOW_PAT }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Re-check the label live right before merging: it may have been retracted since the
+          # first step read it. A retracted approval is not a CI failure, so this exits 0.
+          if ! gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name' | grep -qxF 'review:approved'; then
+            echo "PR #$PR no longer carries review:approved; skipping automerge."
+            exit 0
+          fi
+          # The label alone is not proof THIS commit was reviewed. approval-gate stamps the exact
+          # sha each approval covers as a comment from the github-actions bot (an identity a
+          # human or agent sharing the owner's gh auth cannot forge). The stamp comes from the
+          # separate labeled run, which can land after this run when the label was applied
+          # mid-checks: wait a bounded 120s for it (web PR 445). Still required.
+          stamp_ok=0
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            if gh pr view "$PR" --repo "$REPO" --json comments \
+                 --jq "$(cat .github/scripts/select-approval-comments.jq)" 2>/dev/null \
+                 | bash .github/scripts/approval-stamp-matches.sh "$HEAD_SHA"; then
+              stamp_ok=1
+              break
+            fi
+            [ "$i" -lt 12 ] && sleep 10
+          done
+          if [ "$stamp_ok" != "1" ]; then
+            echo "No approval stamp (from the github-actions bot) for head $HEAD_SHA; skipping automerge."
+            # Label present (checked above). A valid verdict token with no stamp is a stranded
+            # approval: one marker comment and a red check, not a green no-op. The 120s wait was
+            # spent above, so the script's own wait is zero here.
+            stamp_rc=0
+            STAMP_WAIT_TOTAL=0 bash .github/scripts/approval-stamp-missing.sh || stamp_rc=$?
+            exit "$stamp_rc"
+          fi
+          # Verify a live verdict-approval token ourselves, right now: never inferred from whether
+          # approval-gate's token step ran (a skipped job is not a verdict). Approve token for the
+          # live head, no reject token, bot-authored comments excluded.
+          gh pr view "$PR" --repo "$REPO" --json comments \
+               --jq '.comments[] | select(.author.login | test("^github-actions(\\[bot\\])?$") | not) | .body | @base64' \
+               > "$RUNNER_TEMP/verdict-comments.b64"
+          approve_ok=1
+          if ! bash .github/scripts/verdict-approve-token-matches.sh "$HEAD_SHA" < "$RUNNER_TEMP/verdict-comments.b64"; then
+            approve_ok=0
+          fi
+          reject_present=0
+          if bash .github/scripts/verdict-reject-token-matches.sh "$HEAD_SHA" < "$RUNNER_TEMP/verdict-comments.b64"; then
+            reject_present=1
+          fi
+          if [ "$approve_ok" != "1" ] || [ "$reject_present" = "1" ]; then
+            echo "No valid verdict-approval token for the live head (or a reject token vetoes it) on PR #$PR; skipping automerge."
+            exit 0
+          fi
+          # GitHub computes mergeability async; poll until it settles out of UNKNOWN.
+          state=UNKNOWN
+          for i in 1 2 3 4 5; do
+            state=$(gh pr view "$PR" --repo "$REPO" --json mergeable --jq '.mergeable')
+            echo "attempt $i: mergeable=$state"
+            [ "$state" != "UNKNOWN" ] && break
+            sleep 5
+          done
+          if [ "$state" != "MERGEABLE" ]; then
+            echo "PR #$PR is $state (conflict or undetermined); leaving it open for a human."
+            exit 0
+          fi
+          # --squash --delete-branch --match-head-commit, with bounded retries and the one-shot
+          # workflows-permission fallback; see merge-pr.sh and its self-check.
+          bash .github/scripts/merge-pr.sh
+
+      - name: Say that automerge is blocked
+        # The merge step skips silently on a red check; this makes that state announce itself once
+        # per PR. Fires on a faithful red result from this run or from the check-runs lookup.
+        if: ${{ always() && (needs.skillgen-check.result == 'failure' || needs.test.result == 'failure' || needs.gate-selfcheck.result == 'failure' || steps.live-checks.outputs.checks_state == 'blocked') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          marker='<!-- automerge-blocked -->'
+          if gh pr view "$PR" --repo "$REPO" --json comments --jq '.comments[].body' | grep -qF "$marker"; then
+            echo "already announced on PR #$PR"
+            exit 0
+          fi
+          {
+            echo "$marker"
+            echo "**Automerge did not run: a required check failed.** This PR stays open until it is green."
+            echo ""
+            echo "Run: $RUN_URL"
+            echo ""
+            echo "If the failure looks unrelated to this change, bring the branch up to date with v8"
+            echo "first (git merge origin/v8) in case the fix already landed."
+          } > "$RUNNER_TEMP/automerge-blocked.md"
+          gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/automerge-blocked.md"
+
+      - name: Say that automerge is waiting on an in-flight check
+        # The third state. Not a gate and not a failure: it exits 0 and only explains. The run
+        # still in flight reads the label live and merges when its checks pass. Keyed per head sha.
+        if: ${{ always() && steps.live-checks.outputs.checks_state == 'pending' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          marker="<!-- automerge-pending:$HEAD_SHA -->"
+          if gh pr view "$PR" --repo "$REPO" --json comments --jq '.comments[].body' | grep -qF "$marker"; then
+            echo "already announced pending for $HEAD_SHA on PR #$PR"
+            exit 0
+          fi
+          {
+            echo "$marker"
+            echo "**Automerge is waiting: a required check for this commit has not finished.**"
+            echo ""
+            echo "This is not a failure. The approval label landed while the gate run for"
+            echo "\`$HEAD_SHA\` was still in flight (or the check-runs API could not be read), so"
+            echo "automerge declined to merge an unverified commit rather than guess."
+            echo ""
+            echo "Run: $RUN_URL"
+            echo ""
+            echo "**No action needed.** The gate run still in flight merges this PR automatically"
+            echo "once its checks pass, provided the verdict token for this head is in place."
+          } > "$RUNNER_TEMP/automerge-pending.md"
+          gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/automerge-pending.md"

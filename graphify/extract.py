@@ -1444,7 +1444,10 @@ def _resolve_js_import_target(raw: str, str_path: str) -> "tuple[str, Path | Non
     if not raw:
         return None
     resolved_path = _resolve_js_module_path(raw, Path(str_path).parent)
-    if resolved_path is not None:
+    # Only a candidate that exists on disk is a file-level target. A missing one
+    # would mint the id of a file that is not there (file ids drop the
+    # extension), so it falls through to the external id below.
+    if resolved_path is not None and resolved_path.is_file():
         return _make_id(str(resolved_path)), resolved_path
     module_name = raw.split("/")[-1]
     if not module_name:
