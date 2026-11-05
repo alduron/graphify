@@ -26,6 +26,10 @@ inside a member that no edge connects to its owner will not move the owner's has
 safe direction: a missed change costs a stale node nobody flagged, where a false change costs a flag
 against every node anchored to that symbol.
 
+NAME-FREE DIGEST. `body_sha_nf` is the same hash with the symbol's own name blanked out of its header
+line, so a rename (with or without a move) leaves it unchanged. `body_sha` is untouched. Consumers
+read `body_sha_nf` as optional and fall back to `body_sha` when absent.
+
 WHITESPACE IS NORMALISED OUT. Trailing whitespace per line and trailing blank lines are stripped
 before hashing, so a re-indent or a stray newline does not read as a behaviour change. Nothing true of
 a symbol's prose stops being true because its body moved a column.
@@ -100,10 +104,33 @@ def annotate_symbol_spans(result: dict, path: Path) -> dict:
     for node, start in located:
         end = ends[str(node.get("id"))]
         node["end_line"] = end
-        node["body_sha"] = hashlib.sha256(
-            _normalised(lines[start - 1 : end]).encode("utf-8")
-        ).hexdigest()
+        span = lines[start - 1 : end]
+        node["body_sha"] = _digest(_normalised(span))
+        node["body_sha_nf"] = _digest(_normalised(_without_own_name(span, node)))
     return result
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _own_name(node: dict) -> str:
+    """The bare identifier of a symbol: its label minus a leading dot and a trailing call suffix."""
+    label = str(node.get("label") or "").strip().lstrip(".").removesuffix("()")
+    return label if re.fullmatch(r"\w+", label) else ""
+
+
+def _without_own_name(span: list[str], node: dict) -> list[str]:
+    """The span with the symbol's own name blanked out of its header line (first line only).
+
+    Renaming changes the header, so `body_sha` changes though the body does not; this keeps the
+    fingerprint stable across a rename. A name used inside the body is a real reference and stays.
+    """
+    name = _own_name(node)
+    if not name or not span:
+        return span
+    header = re.sub(rf"\b{re.escape(name)}\b", "", span[0], count=1)
+    return [header, *span[1:]]
 
 
 def _naive_ends(located: list[tuple[dict, int]], last_line: int) -> dict[str, int]:
