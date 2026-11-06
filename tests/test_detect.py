@@ -1565,3 +1565,35 @@ def test_is_nested_repo_root_plain_dir_is_walked(tmp_path):
     plain = tmp_path / "src"
     plain.mkdir()
     assert detect_mod._is_nested_repo_root(plain) is False
+
+
+def test_is_nested_repo_root_submodule_inside_superproject_worktree_is_walked(tmp_path):
+    # A submodule checked out inside a superproject LINKED WORKTREE has gitdir
+    # <repo>/.git/worktrees/<name>/modules/<sub>: "worktrees" is NOT the second-to-last segment.
+    sub = tmp_path / "api"
+    sub.mkdir()
+    (sub / ".git").write_text("gitdir: N:/Git/aethergraph/.git/worktrees/tip-view/modules/api\n")
+    assert detect_mod._is_nested_repo_root(sub) is False
+
+
+def test_is_nested_repo_root_plain_linked_worktree_is_pruned(tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / ".git").write_text("gitdir: N:/Git/aethergraph/.git/worktrees/wt\n")
+    assert detect_mod._is_nested_repo_root(wt) is True
+
+
+def test_is_nested_repo_root_submodule_repo_linked_worktree_trailing_slash_is_pruned(tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / ".git").write_text("gitdir: C:/repo/.git/modules/api/worktrees/wt/\n".replace("/", chr(92)))
+    assert detect_mod._is_nested_repo_root(wt) is True
+
+
+def test_detect_walks_submodule_inside_superproject_worktree(tmp_path):
+    sub = tmp_path / "api"
+    sub.mkdir()
+    (sub / ".git").write_text("gitdir: /repo/.git/worktrees/tip-view/modules/api\n")
+    (sub / "service.py").write_text("def run():\n    return 1\n")
+    result = detect(tmp_path)
+    assert any(f.replace("\\", "/").endswith("api/service.py") for f in result["files"]["code"])

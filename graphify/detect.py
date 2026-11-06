@@ -727,14 +727,14 @@ _NON_GIT_VCS_MARKERS = tuple(m for m in _VCS_MARKERS if m != ".git")
 
 
 def _is_linked_git_worktree(git_marker: "Path") -> bool:
-    """True if a `.git` FILE's `gitdir:` target has a `/worktrees/` path segment.
+    """True if a `.git` FILE's `gitdir:` target has `worktrees` as its second-to-last path segment.
 
     A linked worktree's `.git` file points at `<main-repo>/.git/worktrees/<name>` (or, for a worktree
-    of a submodule's own repo, `<main-repo>/.git/modules/<submodule>/worktrees/<name>`) - both carry
-    the literal `/worktrees/` segment. A plain SUBMODULE's `.git` file instead points at
-    `.../modules/<submodule>` with no `worktrees` segment, so this correctly returns False for a
-    submodule (real source this project owns, must be walked) and True only for an actual linked
-    worktree (a full duplicate source copy, must NOT be walked)."""
+    of a submodule's own repo, `<main-repo>/.git/modules/<submodule>/worktrees/<name>`) - both end in
+    `worktrees/<name>`. A SUBMODULE's `.git` file points at `.../modules/<submodule>`, including one
+    inside a superproject worktree (`.../worktrees/<name>/modules/<submodule>`), where `worktrees` is
+    not second-to-last. So this returns False for a submodule (real source, must be walked) and True
+    only for an actual linked worktree (a duplicate source copy, must NOT be walked)."""
     try:
         first_line = git_marker.read_text(encoding="utf-8", errors="ignore").splitlines()[:1]
     except OSError:
@@ -742,13 +742,14 @@ def _is_linked_git_worktree(git_marker: "Path") -> bool:
     if not first_line or not first_line[0].strip().lower().startswith("gitdir:"):
         return False
     target = first_line[0].split(":", 1)[1].strip().replace("\\", "/")
-    return "/worktrees/" in target
+    parts = target.rstrip("/").split("/")
+    return len(parts) >= 2 and parts[-2] == "worktrees"
 
 
 def _is_nested_repo_root(path: "Path") -> bool:
     """True if `path` is its own VCS checkout that extraction must NOT descend into: a linked git
     worktree, a nested independent clone (full `.git` DIR, not a submodule pointer), or another VCS
-    checkout. A git SUBMODULE (`.git` FILE pointing at `.../modules/<name>`, no `/worktrees/` segment)
+    checkout. A git SUBMODULE (`.git` FILE pointing at `.../modules/<name>`, `worktrees` not second-to-last)
     is real source this project owns and must be walked, so it is deliberately excluded here - only a
     linked worktree or a genuinely separate clone has its own source boundary that would duplicate
     content into this graph. Only ever called on a SUBDIRECTORY of the scan root, so the root's own
