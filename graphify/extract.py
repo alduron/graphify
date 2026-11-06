@@ -16192,6 +16192,10 @@ def _extract_parallel(
                 try:
                     idx, result = future.result()
                     per_file[idx] = result
+                except concurrent.futures.process.BrokenProcessPool:
+                    # A dead pool must reach the sequential fallback below,
+                    # not be logged per file and dropped.
+                    raise
                 except Exception as exc:
                     pos = futures[future]
                     print(

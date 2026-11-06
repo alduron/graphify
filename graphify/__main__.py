@@ -4649,8 +4649,13 @@ def main() -> None:
             try:
                 ast_result = _ast_extract(code_files, **ast_kwargs)
             except Exception as exc:
-                print(f"[graphify extract] AST extraction failed: {exc}", file=sys.stderr)
-                ast_result = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
+                # Never continue with an empty graph: a 0-node graph.json at
+                # exit 0 reads as "the repo has no symbols". Write nothing.
+                print(
+                    f"[graphify extract] AST extraction failed: {type(exc).__name__}: {exc!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         stages.mark("AST extract")
 
         # Semantic extraction on docs/papers/images. Check cache first.
